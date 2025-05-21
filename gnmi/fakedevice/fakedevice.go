@@ -42,7 +42,7 @@ const (
 	controlcardComponentName = "Supervisor"
 
 	// Number of each component type
-	numLineCard       = 10
+	numLineCard       = 8
 	numFabricCard     = 6
 	numSupervisorCard = 2
 )
@@ -79,7 +79,7 @@ func RebootComponent(ctx context.Context, c *ygnmi.Client, componentName string,
 	}
 
 	// Simulate a brief reboot period
-	time.Sleep(2 * time.Minute)
+	time.Sleep(10 * time.Second)
 
 	// Now restore the component OperStatus (reboot completed)
 	finalState := oc.PlatformTypes_COMPONENT_OPER_STATUS_ACTIVE
@@ -122,10 +122,10 @@ func NewChassisComponentsTask() *reconciler.BuiltReconciler {
 			batch := &ygnmi.SetBatch{}
 
 			// Initialize supervisors
-			for i := 0; i < numSupervisorCard; i++ {
+			for i := 1; i <= numSupervisorCard; i++ {
 				componentName := fmt.Sprintf("%s%d", controlcardComponentName, i)
 				redundantRole := oc.PlatformTypes_ComponentRedundantRole_PRIMARY
-				if i == 1 {
+				if i == 2 {
 					redundantRole = oc.PlatformTypes_ComponentRedundantRole_SECONDARY
 				}
 				component := &oc.Component{
