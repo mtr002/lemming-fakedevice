@@ -41,6 +41,7 @@ const (
 	fabricComponentName      = "Fabric"
 	controlcardComponentName = "Supervisor"
 
+	// TODO: Make lemming chassis configurable
 	// Number of each component type
 	numLineCard       = 8
 	numFabricCard     = 6
