@@ -45,6 +45,14 @@ const (
 	numLineCard       = 8
 	numFabricCard     = 6
 	numSupervisorCard = 2
+
+	// Supervisor configuration constants
+	supervisor1Name = "Supervisor1"
+	supervisor2Name = "Supervisor2"
+
+	// Simulation duration
+	switchoverDuration = 10 * time.Second
+	rebootDuration     = 10 * time.Second
 )
 
 // Reboot updates the system boot time to the provided Unix time.
@@ -79,7 +87,7 @@ func RebootComponent(ctx context.Context, c *ygnmi.Client, componentName string,
 	}
 
 	// Simulate a brief reboot period
-	time.Sleep(10 * time.Second)
+	time.Sleep(rebootDuration)
 
 	// Now restore the component OperStatus (reboot completed)
 	finalState := oc.PlatformTypes_COMPONENT_OPER_STATUS_ACTIVE
@@ -88,6 +96,57 @@ func RebootComponent(ctx context.Context, c *ygnmi.Client, componentName string,
 	}
 
 	log.Infof("Component %s reboot completed successfully", componentName)
+	return nil
+}
+
+// SwitchoverSupervisor performs supervisor switchover by swapping the redundant roles and updating related state
+func SwitchoverSupervisor(ctx context.Context, c *ygnmi.Client, targetSupervisor string, switchoverTime int64) error {
+	log.Infof("Performing supervisor switchover to %s at time %d", targetSupervisor, switchoverTime)
+
+	// Determine the other supervisor name using constants
+	var currentActiveSupervisor string
+	switch targetSupervisor {
+	case supervisor1Name:
+		currentActiveSupervisor = supervisor2Name
+	case supervisor2Name:
+		currentActiveSupervisor = supervisor1Name
+	default:
+		return fmt.Errorf("invalid target supervisor %q, expected %q or %q",
+			targetSupervisor, supervisor1Name, supervisor2Name)
+	}
+
+	targetPath := ocpath.Root().Component(targetSupervisor)
+	currentPath := ocpath.Root().Component(currentActiveSupervisor)
+
+	// Simulate switchover duration
+	time.Sleep(switchoverDuration)
+
+	// Batch all updates for atomicity
+	batch := &ygnmi.SetBatch{}
+
+	// Swap the redundant roles
+	gnmiclient.BatchReplace(batch, targetPath.RedundantRole().State(), oc.PlatformTypes_ComponentRedundantRole_PRIMARY)
+	gnmiclient.BatchReplace(batch, currentPath.RedundantRole().State(), oc.PlatformTypes_ComponentRedundantRole_SECONDARY)
+
+	// Update switchover timestamps for both supervisors
+	gnmiclient.BatchReplace(batch, targetPath.LastSwitchoverTime().State(), uint64(switchoverTime))
+	gnmiclient.BatchReplace(batch, currentPath.LastSwitchoverTime().State(), uint64(switchoverTime))
+
+	// Update switchover reasons for both supervisors
+	gnmiclient.BatchReplace(batch, targetPath.LastSwitchoverReason().Trigger().State(),
+		oc.PlatformTypes_ComponentRedundantRoleSwitchoverReasonTrigger_USER_INITIATED)
+	gnmiclient.BatchReplace(batch, targetPath.LastSwitchoverReason().Details().State(), "user initiated switchover")
+	gnmiclient.BatchReplace(batch, currentPath.LastSwitchoverReason().Trigger().State(),
+		oc.PlatformTypes_ComponentRedundantRoleSwitchoverReasonTrigger_USER_INITIATED)
+	gnmiclient.BatchReplace(batch, currentPath.LastSwitchoverReason().Details().State(), "user initiated switchover")
+
+	// Apply all updates atomically
+	if _, err := batch.Set(ctx, c); err != nil {
+		return fmt.Errorf("failed to apply switchover updates: %v", err)
+	}
+
+	log.Infof("Supervisor switchover completed successfully: %s is now PRIMARY, %s is now SECONDARY",
+		targetSupervisor, currentActiveSupervisor)
 	return nil
 }
 
@@ -129,14 +188,20 @@ func NewChassisComponentsTask() *reconciler.BuiltReconciler {
 					redundantRole = oc.PlatformTypes_ComponentRedundantRole_SECONDARY
 				}
 				component := &oc.Component{
-					Name:             ygot.String(componentName),
-					Type:             oc.PlatformTypes_OPENCONFIG_HARDWARE_COMPONENT_CONTROLLER_CARD,
-					OperStatus:       oc.PlatformTypes_COMPONENT_OPER_STATUS_ACTIVE,
-					RedundantRole:    redundantRole,
-					Parent:           ygot.String(chassisComponentName),
-					SoftwareVersion:  ygot.String("current"),
-					LastRebootTime:   ygot.Uint64(uint64(now)),
-					LastRebootReason: oc.PlatformTypes_COMPONENT_REBOOT_REASON_UNSET,
+					Name:               ygot.String(componentName),
+					Type:               oc.PlatformTypes_OPENCONFIG_HARDWARE_COMPONENT_CONTROLLER_CARD,
+					OperStatus:         oc.PlatformTypes_COMPONENT_OPER_STATUS_ACTIVE,
+					RedundantRole:      redundantRole,
+					Parent:             ygot.String(chassisComponentName),
+					SoftwareVersion:    ygot.String("current"),
+					LastRebootTime:     ygot.Uint64(uint64(now)),
+					LastRebootReason:   oc.PlatformTypes_COMPONENT_REBOOT_REASON_UNSET,
+					SwitchoverReady:    ygot.Bool(true),
+					LastSwitchoverTime: ygot.Uint64(uint64(now)),
+					LastSwitchoverReason: &oc.Component_LastSwitchoverReason{
+						Trigger: oc.PlatformTypes_ComponentRedundantRoleSwitchoverReasonTrigger_SYSTEM_INITIATED,
+						Details: ygot.String("initial system startup"),
+					},
 				}
 				gnmiclient.BatchUpdate(batch, ocpath.Root().Component(componentName).State(), component)
 				log.Infof("Batching initialization for supervisor component %s", componentName)
