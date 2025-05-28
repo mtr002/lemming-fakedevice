@@ -20,15 +20,6 @@ import (
 	"time"
 
 	log "github.com/golang/glog"
-	"github.com/openconfig/ygnmi/ygnmi"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
-	"github.com/openconfig/lemming/gnmi/fakedevice"
-	"github.com/openconfig/lemming/gnmi/oc"
-	"github.com/openconfig/lemming/gnmi/oc/ocpath"
-
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 	bpb "github.com/openconfig/gnoi/bgp"
 	cmpb "github.com/openconfig/gnoi/cert"
@@ -43,6 +34,15 @@ import (
 	spb "github.com/openconfig/gnoi/system"
 	pb "github.com/openconfig/gnoi/types"
 	wrpb "github.com/openconfig/gnoi/wavelength_router"
+	"github.com/openconfig/ygnmi/ygnmi"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/openconfig/lemming/gnmi/oc"
+
+	"github.com/openconfig/lemming/gnmi/fakedevice"
+	"github.com/openconfig/lemming/gnmi/oc/ocpath"
 )
 
 const (
@@ -385,9 +385,23 @@ func (s *system) SwitchControlProcessor(ctx context.Context, r *spb.SwitchContro
 		return nil, status.Errorf(codes.NotFound, "target supervisor %q does not exist", targetSupervisor)
 	}
 
-	// Check if target is already the active supervisor (invalid operation)
+	// Check if target is already the active supervisor (no-op case)
 	if targetSupervisor == activeSupervisor {
-		return nil, status.Errorf(codes.FailedPrecondition, "supervisor %q is already active, no switchover needed", targetSupervisor)
+		log.Infof("Target supervisor %q is already active, returning current state (no-op)", targetSupervisor)
+
+		// Get the current active supervisor info for response
+		componentPath := ocpath.Root().Component(targetSupervisor)
+		component, err := ygnmi.Get(ctx, s.c, componentPath.State())
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to get current active supervisor info: %v", err)
+		}
+
+		// Return successful response for no-op case
+		return &spb.SwitchControlProcessorResponse{
+			ControlProcessor: r.GetControlProcessor(),
+			Version:          component.GetSoftwareVersion(),
+			Uptime:           0,
+		}, nil
 	}
 
 	// Perform the actual switchover

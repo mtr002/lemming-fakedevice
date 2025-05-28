@@ -578,11 +578,20 @@ func TestSwitchControlProcessor(t *testing.T) {
 						},
 					},
 				}
-				_, err := s.SwitchControlProcessor(ctx, req)
-				if err == nil {
-					t.Error("Expected error when switching to already-active supervisor")
-				} else if got := status.Code(err); got != codes.FailedPrecondition {
-					t.Errorf("Expected FailedPrecondition error, got %v", got)
+				resp, err := s.SwitchControlProcessor(ctx, req)
+				if err != nil {
+					t.Errorf("Expected successful response for no-op switchover, got error: %v", err)
+				}
+				if resp == nil {
+					t.Error("Expected response but got nil")
+				}
+
+				// Verify response fields
+				if resp.ControlProcessor == nil {
+					t.Error("Expected ControlProcessor in response")
+				}
+				if resp.Version == "" {
+					t.Error("Expected Version in response")
 				}
 			},
 		},
