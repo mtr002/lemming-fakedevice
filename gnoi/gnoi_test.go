@@ -584,6 +584,7 @@ func TestSwitchControlProcessor(t *testing.T) {
 				}
 				if resp == nil {
 					t.Error("Expected response but got nil")
+					return
 				}
 
 				// Verify response fields

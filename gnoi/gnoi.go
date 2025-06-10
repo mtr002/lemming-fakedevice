@@ -545,13 +545,14 @@ func (s *system) getSupervisorRole(ctx context.Context) (activeSupervisor, stand
 	}
 
 	// Determine active and standby based on the results
-	if supervisor1Active && !supervisor2Active {
+	switch {
+	case supervisor1Active && !supervisor2Active:
 		return supervisor1Name, supervisor2Name, nil
-	} else if supervisor2Active && !supervisor1Active {
+	case supervisor2Active && !supervisor1Active:
 		return supervisor2Name, supervisor1Name, nil
-	} else if supervisor1Active && supervisor2Active {
+	case supervisor1Active && supervisor2Active:
 		return "", "", status.Errorf(codes.FailedPrecondition, "both supervisors are active")
-	} else {
+	default:
 		return "", "", status.Errorf(codes.FailedPrecondition, "no active supervisor found")
 	}
 }
