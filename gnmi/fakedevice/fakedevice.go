@@ -75,43 +75,43 @@ func Reboot(ctx context.Context, c *ygnmi.Client, rebootTime int64) error {
 func RebootComponent(ctx context.Context, c *ygnmi.Client, componentName string, rebootTime int64) error {
 	log.Infof("Performing component reboot for %s at time %d", componentName, rebootTime)
 
-	// Get current component state to ensure it exists
 	_, err := ygnmi.Get(ctx, c, ocpath.Root().Component(componentName).State())
 	if err != nil {
 		return fmt.Errorf("failed to get component %s state: %v", componentName, err)
 	}
 
-	// Set component to inactive temporarily
-	if _, err := gnmiclient.Replace(ctx, c, ocpath.Root().Component(componentName).OperStatus().State(), oc.PlatformTypes_COMPONENT_OPER_STATUS_INACTIVE); err != nil {
-		return fmt.Errorf("failed to set component %s inactive: %v", componentName, err)
-	}
+	// Add timestamp metadata to context like system reboot
+	timestampedCtx := gnmi.AddTimestampMetadata(ctx, rebootTime)
 
-	// Update last reboot time
-	if _, err := gnmiclient.Replace(ctx, c, ocpath.Root().Component(componentName).LastRebootTime().State(), uint64(rebootTime)); err != nil {
-		return fmt.Errorf("failed to update component %s reboot time: %v", componentName, err)
-	}
+	batch := &ygnmi.SetBatch{}
 
-	// Update reboot reason
-	if _, err := gnmiclient.Replace(ctx, c, ocpath.Root().Component(componentName).LastRebootReason().State(), oc.PlatformTypes_COMPONENT_REBOOT_REASON_REBOOT_USER_INITIATED); err != nil {
-		return fmt.Errorf("failed to update component %s reboot reason: %v", componentName, err)
+	// Set component to inactive and update reboot time
+	gnmiclient.BatchReplace(batch, ocpath.Root().Component(componentName).OperStatus().State(), oc.PlatformTypes_COMPONENT_OPER_STATUS_INACTIVE)
+	gnmiclient.BatchReplace(batch, ocpath.Root().Component(componentName).LastRebootTime().State(), uint64(rebootTime))
+	gnmiclient.BatchReplace(batch, ocpath.Root().Component(componentName).LastRebootReason().State(), oc.PlatformTypes_COMPONENT_REBOOT_REASON_REBOOT_USER_INITIATED)
+
+	if _, err := batch.Set(timestampedCtx, c); err != nil {
+		return fmt.Errorf("failed to update component %s state: %v", componentName, err)
 	}
 
 	// Simulate a brief reboot period
 	time.Sleep(rebootDuration)
 
 	// Now restore the component OperStatus (reboot completed)
-	finalState := oc.PlatformTypes_COMPONENT_OPER_STATUS_ACTIVE
-	if _, err := gnmiclient.Replace(ctx, c, ocpath.Root().Component(componentName).OperStatus().State(), finalState); err != nil {
-		return fmt.Errorf("failed to restore component %s state after reboot: %v", componentName, err)
+	if _, err := gnmiclient.Replace(timestampedCtx, c, ocpath.Root().Component(componentName).OperStatus().State(), oc.PlatformTypes_COMPONENT_OPER_STATUS_ACTIVE); err != nil {
+		return fmt.Errorf("failed to set component %s active: %v", componentName, err)
 	}
 
-	log.Infof("Component %s reboot completed successfully", componentName)
+	log.Infof("Component %s reboot completed and set to active", componentName)
 	return nil
 }
 
 // SwitchoverSupervisor performs supervisor switchover by swapping the redundant roles and updating related state
 func SwitchoverSupervisor(ctx context.Context, c *ygnmi.Client, targetSupervisor string, currentActiveSupervisor string, switchoverTime int64) error {
 	log.Infof("Performing supervisor switchover from %s to %s at time %d", currentActiveSupervisor, targetSupervisor, switchoverTime)
+
+	// Add timestamp metadata to context
+	timestampedCtx := gnmi.AddTimestampMetadata(ctx, switchoverTime)
 
 	targetPath := ocpath.Root().Component(targetSupervisor)
 	currentPath := ocpath.Root().Component(currentActiveSupervisor)
@@ -136,7 +136,7 @@ func SwitchoverSupervisor(ctx context.Context, c *ygnmi.Client, targetSupervisor
 		oc.PlatformTypes_ComponentRedundantRoleSwitchoverReasonTrigger_USER_INITIATED)
 	gnmiclient.BatchReplace(batch, currentPath.LastSwitchoverReason().Details().State(), "user initiated switchover")
 
-	if _, err := batch.Set(ctx, c); err != nil {
+	if _, err := batch.Set(timestampedCtx, c); err != nil {
 		return fmt.Errorf("failed to apply switchover updates: %v", err)
 	}
 
@@ -149,22 +149,21 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 	log.Infof("KillProcess called with pid=%d, name=%s, signal=%v, restart=%v", pid, processName, signal, restart)
 
 	processPath := ocpath.Root().System().Process(uint64(pid))
+	currentTime := time.Now().UnixNano()
+	timestampedCtx := gnmi.AddTimestampMetadata(ctx, currentTime)
 
 	// HUP signal - reload configuration
 	if signal == spb.KillProcessRequest_SIGNAL_HUP {
 		log.Infof("Reloading process %s (PID: %d) configuration", processName, pid)
 
-		reloadTime := time.Now().UnixNano()
-		timestampedCtx := gnmi.AddTimestampMetadata(ctx, reloadTime)
-
-		if _, err := gnmiclient.Replace(timestampedCtx, c, processPath.StartTime().State(), uint64(reloadTime)); err != nil {
+		if _, err := gnmiclient.Replace(timestampedCtx, c, processPath.StartTime().State(), uint64(currentTime)); err != nil {
 			return fmt.Errorf("failed to update process %s reload time: %v", processName, err)
 		}
 		log.Infof("Successfully reloaded process %s (PID: %d)", processName, pid)
 		return nil
 	}
 
-	if _, err := gnmiclient.Delete(ctx, c, processPath.State()); err != nil {
+	if _, err := gnmiclient.Delete(timestampedCtx, c, processPath.State()); err != nil {
 		return fmt.Errorf("failed to delete process %s (PID: %d): %v", processName, pid, err)
 	}
 
@@ -185,7 +184,7 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 
 			// Create new process with same name but new PID
 			restartTime := time.Now().UnixNano()
-			timestampedCtx := gnmi.AddTimestampMetadata(ctx, restartTime)
+			restartCtx := gnmi.AddTimestampMetadata(ctx, restartTime)
 
 			newProcess := &oc.System_Process{
 				Name:      ygot.String(processName),
@@ -200,7 +199,7 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 			}
 
 			newProcessPath := ocpath.Root().System().Process(uint64(newPID))
-			if _, err := gnmiclient.Replace(timestampedCtx, c, newProcessPath.State(), newProcess); err != nil {
+			if _, err := gnmiclient.Replace(restartCtx, c, newProcessPath.State(), newProcess); err != nil {
 				log.Errorf("Failed to restart process %s with new PID %d: %v", processName, newPID, err)
 				return
 			}
