@@ -17,6 +17,8 @@ package fakedevice
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
+	"sync"
 	"time"
 
 	log "github.com/golang/glog"
@@ -63,7 +65,34 @@ const (
 	defaultCpuUtilization    = 1        // 1% CPU
 	defaultMemoryUsage       = 10485760 // 10MB
 	defaultMemoryUtilization = 2        // 2% memory
+
+	// Ping simulation configuration - final latency = baseLatency ± random jitter
+	defaultBaseLatency    = 50 * time.Millisecond // Base latency for ping responses
+	defaultLatencyJitter  = 20 * time.Millisecond // ±20ms jitter variation
+	defaultPacketLossRate = 0.0                   // 0% packet loss by default
+	defaultTTL            = 64                    // Default TTL value
 )
+
+var (
+	// Thread-safe random source for ping simulation
+	randMu  sync.Mutex
+	randSrc = rand.NewPCG(uint64(time.Now().UnixNano()), uint64(time.Now().UnixNano()>>32))
+	randGen = rand.New(randSrc) //nolint:gosec // Using math/rand for network simulation
+)
+
+// TODO: Add per-destination ping configuration:
+// - Host unreachable
+// - IPv4/IPv6 differences
+// - Network congestion
+
+// PingPacketResult represents the result of a single ping packet
+type PingPacketResult struct {
+	Sequence int32
+	RTT      time.Duration
+	Bytes    uint32
+	TTL      int32
+	Success  bool
+}
 
 // Reboot updates the system boot time to the provided Unix time.
 func Reboot(ctx context.Context, c *ygnmi.Client, rebootTime int64) error {
@@ -74,32 +103,18 @@ func Reboot(ctx context.Context, c *ygnmi.Client, rebootTime int64) error {
 // RebootComponent updates the component's last reboot time and reason.
 func RebootComponent(ctx context.Context, c *ygnmi.Client, componentName string, rebootTime int64) error {
 	log.Infof("Performing component reboot for %s at time %d", componentName, rebootTime)
-
-	_, err := ygnmi.Get(ctx, c, ocpath.Root().Component(componentName).State())
-	if err != nil {
-		return fmt.Errorf("failed to get component %s state: %v", componentName, err)
-	}
-
-	// Add timestamp metadata to context like system reboot
 	timestampedCtx := gnmi.AddTimestampMetadata(ctx, rebootTime)
+
+	time.Sleep(rebootDuration)
 
 	batch := &ygnmi.SetBatch{}
 
-	// Set component to inactive and update reboot time
-	gnmiclient.BatchReplace(batch, ocpath.Root().Component(componentName).OperStatus().State(), oc.PlatformTypes_COMPONENT_OPER_STATUS_INACTIVE)
+	// Update reboot time and reason
 	gnmiclient.BatchReplace(batch, ocpath.Root().Component(componentName).LastRebootTime().State(), uint64(rebootTime))
 	gnmiclient.BatchReplace(batch, ocpath.Root().Component(componentName).LastRebootReason().State(), oc.PlatformTypes_COMPONENT_REBOOT_REASON_REBOOT_USER_INITIATED)
 
 	if _, err := batch.Set(timestampedCtx, c); err != nil {
 		return fmt.Errorf("failed to update component %s state: %v", componentName, err)
-	}
-
-	// Simulate a brief reboot period
-	time.Sleep(rebootDuration)
-
-	// Now restore the component OperStatus (reboot completed)
-	if _, err := gnmiclient.Replace(timestampedCtx, c, ocpath.Root().Component(componentName).OperStatus().State(), oc.PlatformTypes_COMPONENT_OPER_STATUS_ACTIVE); err != nil {
-		return fmt.Errorf("failed to set component %s active: %v", componentName, err)
 	}
 
 	log.Infof("Component %s reboot completed and set to active", componentName)
@@ -110,9 +125,7 @@ func RebootComponent(ctx context.Context, c *ygnmi.Client, componentName string,
 func SwitchoverSupervisor(ctx context.Context, c *ygnmi.Client, targetSupervisor string, currentActiveSupervisor string, switchoverTime int64) error {
 	log.Infof("Performing supervisor switchover from %s to %s at time %d", currentActiveSupervisor, targetSupervisor, switchoverTime)
 
-	// Add timestamp metadata to context
 	timestampedCtx := gnmi.AddTimestampMetadata(ctx, switchoverTime)
-
 	targetPath := ocpath.Root().Component(targetSupervisor)
 	currentPath := ocpath.Root().Component(currentActiveSupervisor)
 
@@ -210,6 +223,104 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 	return nil
 }
 
+// PingSimulation simulates ping operation with configurable network conditions
+func PingSimulation(ctx context.Context, destination string, count int32, interval time.Duration, wait time.Duration, size uint32, responseChan chan<- *PingPacketResult) error {
+	log.Infof("Starting ping simulation to %s with count=%d, interval=%v, wait=%v",
+		destination, count, interval, wait)
+
+	baseLatency := defaultBaseLatency
+	latencyJitter := defaultLatencyJitter
+	packetLossRate := float32(defaultPacketLossRate)
+	ttl := int32(defaultTTL)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	packetCount := int32(0)
+	maxPackets := count
+	if maxPackets == -1 {
+		maxPackets = 1<<31 - 1
+	}
+
+	for packetCount < maxPackets {
+		select {
+		case <-ctx.Done():
+			log.Infof("Ping to %s cancelled", destination)
+			return ctx.Err()
+		case <-ticker.C:
+			packetCount++
+
+			// Simulate network conditions for this packet
+			networkLatency := simulateLatency(baseLatency, latencyJitter)
+			packetLost := packetLossRate > 0 && shouldDropPacket(packetLossRate)
+
+			var result *PingPacketResult
+
+			switch {
+			case packetLost:
+				// Packet lost - wait for timeout
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				result = &PingPacketResult{
+					Sequence: packetCount,
+					RTT:      0,
+					Bytes:    0,
+					TTL:      0,
+					Success:  false,
+				}
+				log.Infof("Ping to %s: seq=%d TIMEOUT (packet lost)", destination, packetCount)
+
+			case networkLatency > wait:
+				// Response would arrive after wait timeout
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				result = &PingPacketResult{
+					Sequence: packetCount,
+					RTT:      0,
+					Bytes:    0,
+					TTL:      0,
+					Success:  false,
+				}
+				log.Infof("Ping to %s: seq=%d TIMEOUT (latency %v > wait %v)",
+					destination, packetCount, networkLatency, wait)
+
+			default:
+				// Successful response within wait time
+				select {
+				case <-time.After(networkLatency):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				result = &PingPacketResult{
+					Sequence: packetCount,
+					RTT:      networkLatency,
+					Bytes:    size,
+					TTL:      ttl,
+					Success:  true,
+				}
+				log.Infof("Ping to %s: seq=%d time=%v bytes=%d ttl=%d",
+					destination, packetCount, networkLatency, size, ttl)
+			}
+
+			// Send result with non-blocking send
+			select {
+			case responseChan <- result:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	log.Infof("Ping simulation to %s completed after %d packets", destination, packetCount)
+	return nil
+}
+
 // NewBootTimeTask initializes boot-related paths.
 func NewBootTimeTask() *reconciler.BuiltReconciler {
 	rec := reconciler.NewBuilder("boot time").
@@ -263,7 +374,7 @@ func NewChassisComponentsTask() *reconciler.BuiltReconciler {
 						Details: ygot.String("initial system startup"),
 					},
 				}
-				gnmiclient.BatchUpdate(batch, ocpath.Root().Component(componentName).State(), component)
+				gnmiclient.BatchReplace(batch, ocpath.Root().Component(componentName).State(), component)
 				log.Infof("Batching initialization for supervisor component %s", componentName)
 			}
 
@@ -279,7 +390,7 @@ func NewChassisComponentsTask() *reconciler.BuiltReconciler {
 					LastRebootTime:   ygot.Uint64(uint64(now)),
 					LastRebootReason: oc.PlatformTypes_COMPONENT_REBOOT_REASON_UNSET,
 				}
-				gnmiclient.BatchUpdate(batch, ocpath.Root().Component(componentName).State(), component)
+				gnmiclient.BatchReplace(batch, ocpath.Root().Component(componentName).State(), component)
 				log.Infof("Batching initialization for line card component %s", componentName)
 			}
 
@@ -463,4 +574,45 @@ func generateNewPID(ctx context.Context, c *ygnmi.Client) (uint32, error) {
 		}
 	}
 	return 0, fmt.Errorf("no PID available")
+}
+
+// getRandomInt64 returns a random int64 in the range [min, max)
+func getRandomInt64(min, max int64) int64 {
+	randMu.Lock()
+	defer randMu.Unlock()
+	if min >= max {
+		return min
+	}
+	return randGen.Int64N(max-min) + min
+}
+
+// shouldDropPacket determines if a packet should be dropped based on loss rate
+func shouldDropPacket(lossRate float32) bool {
+	if lossRate <= 0 {
+		return false
+	}
+	if lossRate >= 1.0 {
+		return true
+	}
+	lossPercentage := int64(lossRate * 100)
+	randomPercent := getRandomInt64(0, 100)
+	return randomPercent < lossPercentage
+}
+
+// simulateLatency generates realistic network latency with jitter
+func simulateLatency(baseLatency, jitter time.Duration) time.Duration {
+	if jitter == 0 {
+		return baseLatency
+	}
+	// Generate random jitter between -jitter and +jitter
+	jitterNs := jitter.Nanoseconds()
+	randomJitter := getRandomInt64(-jitterNs, jitterNs+1)
+	finalLatency := baseLatency + time.Duration(randomJitter)
+
+	// Ensure latency is never negative
+	if finalLatency <= 0 {
+		finalLatency = time.Millisecond
+	}
+
+	return finalLatency
 }
