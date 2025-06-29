@@ -48,6 +48,7 @@ var (
 	gcpProject     = pflag.String("gcp_project", "", "GCP project to export to, by default it will use project where the GCE instance is running")
 	faultAddr      = pflag.String("fault_addr", ":9399", "fault server listen address")
 	faultEnable    = pflag.Bool("enable_fault", true, "Enable fault service")
+	configFile     = pflag.String("config_file", "", "Path to configuration file (supports .textproto/.pb.txt/.pbtxt formats). If not specified, uses built-in defaults.")
 )
 
 func main() {
@@ -61,6 +62,10 @@ func main() {
 	}
 	defer cancel(context.Background())
 
+	// Determine config file path from multiple sources
+	configPath := resolveConfigFile(*configFile)
+	log.Infof("Using config file: %v", configPath)
+
 	creds := insecure.NewCredentials()
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
 		var err error
@@ -70,7 +75,13 @@ func main() {
 		}
 	}
 
-	f, err := lemming.New(*target, *zapiAddr, lemming.WithTransportCreds(creds),
+	var opts []lemming.Option
+	if configPath != "" {
+		opts = append(opts, lemming.WithConfigFile(configPath))
+	}
+
+	f, err := lemming.New(*target, *zapiAddr, append(opts,
+		lemming.WithTransportCreds(creds),
 		lemming.WithGRIBIAddr(*gribiAddr),
 		lemming.WithGNMIAddr(*gnmiAddr),
 		lemming.WithBGPPort(uint16(*bgpPort)),
@@ -79,7 +90,7 @@ func main() {
 		lemming.WithFaultInjection(*faultEnable),
 		lemming.WithP4RTAddr(*p4rtAddr),
 		lemming.WithDataplaneOpts(dplaneopts.WithSkipIPValidation()),
-	)
+	)...)
 	if err != nil {
 		log.Exitf("Failed to start lemming: %v", err)
 	}
@@ -94,4 +105,20 @@ func main() {
 		log.Info("received sigint")
 		return
 	}
+}
+
+// resolveConfigFile determines the config file path from the command line flag only.
+// If no config file is specified, returns empty string to use built-in default.
+func resolveConfigFile(flagValue string) string {
+	// Only use command line flag --config_file
+	if flagValue != "" {
+		if _, err := os.Stat(flagValue); err == nil {
+			return flagValue
+		}
+		log.Exitf("Config file specified via --config_file does not exist: %s", flagValue)
+	}
+
+	// No config file specified, use built-in default
+	log.Info("No config file specified via --config_file, using built-in default configuration")
+	return ""
 }
