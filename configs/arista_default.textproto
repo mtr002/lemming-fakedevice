@@ -1,0 +1,92 @@
+# Arista-style configuration for lemming fakedevice
+# This configuration demonstrates Arista EOS-like naming conventions and structure
+
+vendor {
+  name: "Arista"
+  model: "DCS-7050QX-32"
+  os_version: "4.28.3M"
+}
+
+components {
+  supervisor1_name: "SUP1"
+  supervisor2_name: "SUP2"
+  chassis_name: "Chassis"
+  linecard_prefix: ""
+  fabric_prefix: "FC"
+  
+  linecard {
+    count: 2
+    start_index: 3  # Start from Linecard3
+    step: 1
+  }
+  
+  fabric {
+    count: 4
+    start_index: 0
+    step: 1
+  }
+}
+
+# Arista-style processes
+processes {
+  name: "Sysdb"
+  pid: 1001
+  cpu_usage_user: 2000000
+  cpu_usage_system: 1000000
+  cpu_utilization: 5
+  memory_usage: 52428800
+  memory_utilization: 3
+}
+
+processes {
+  name: "ConfigAgent"
+  pid: 1002
+  cpu_usage_user: 1500000
+  cpu_usage_system: 750000
+  cpu_utilization: 3
+  memory_usage: 31457280
+  memory_utilization: 2
+}
+
+processes {
+  name: "Rib"
+  pid: 1003
+  cpu_usage_user: 3000000
+  cpu_usage_system: 1500000
+  cpu_utilization: 8
+  memory_usage: 104857600
+  memory_utilization: 5
+}
+
+processes {
+  name: "Fib"
+  pid: 1004
+  cpu_usage_user: 2500000
+  cpu_usage_system: 1250000
+  cpu_utilization: 6
+  memory_usage: 83886080
+  memory_utilization: 4
+}
+
+processes {
+  name: "KernelFib"
+  pid: 1005
+  cpu_usage_user: 2000000
+  cpu_usage_system: 2000000
+  cpu_utilization: 7
+  memory_usage: 62914560
+  memory_utilization: 3
+}
+
+timing {
+  switchover_duration_ms: 3000  # Slightly longer for Arista
+  reboot_duration_ms: 5000
+}
+
+network_sim {
+  base_latency_ms: 30     # Lower latency for datacenter switch
+  latency_jitter_ms: 10
+  packet_loss_rate: 0.0
+  default_ttl: 64
+}
+
