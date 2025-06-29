@@ -48,7 +48,7 @@ var (
 	gcpProject     = pflag.String("gcp_project", "", "GCP project to export to, by default it will use project where the GCE instance is running")
 	faultAddr      = pflag.String("fault_addr", ":9399", "fault server listen address")
 	faultEnable    = pflag.Bool("enable_fault", true, "Enable fault service")
-	configFile     = pflag.String("config_file", os.Getenv("LEMMING_CONFIG_FILE"), "Path to configuration file (supports .textproto/.pb.txt/.pbtxt formats). If not specified, checks LEMMING_CONFIG_FILE environment variable, then uses built-in defaults.")
+	configFile     = pflag.String("config_file", "", "Path to configuration file (supports .textproto/.pb.txt/.pbtxt formats). If not specified, uses built-in defaults.")
 )
 
 func main() {
@@ -107,10 +107,10 @@ func main() {
 	}
 }
 
-// resolveConfigFile determines the config file path from command line flag.
-// The loader.Load() function will handle environment variables and defaults.
+// resolveConfigFile determines the config file path from the command line flag only.
+// If no config file is specified, returns empty string to use built-in default.
 func resolveConfigFile(flagValue string) string {
-	// If flag is specified, validate it exists
+	// Only use command line flag --config_file
 	if flagValue != "" {
 		if _, err := os.Stat(flagValue); err == nil {
 			return flagValue
@@ -118,6 +118,7 @@ func resolveConfigFile(flagValue string) string {
 		log.Exitf("Config file specified via --config_file does not exist: %s", flagValue)
 	}
 
-	// Return empty string to let loader handle env vars and defaults
+	// No config file specified, use built-in default
+	log.Info("No config file specified via --config_file, using built-in default configuration")
 	return ""
 }

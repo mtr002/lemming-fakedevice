@@ -27,19 +27,11 @@ import (
 	configpb "github.com/openconfig/lemming/proto/config"
 )
 
-// Load loads the lemming configuration with smart merging and environment variable support.
+// Load loads the lemming configuration with smart merging.
 // User config is merged with defaults for any missing sections.
 func Load(configFile string) (*configpb.LemmingConfig, error) {
 	var userConfig *configpb.LemmingConfig
 	var err error
-
-	// Check for environment variable override if no config file provided
-	if configFile == "" {
-		if envConfigFile := os.Getenv("LEMMING_CONFIG_FILE"); envConfigFile != "" {
-			configFile = envConfigFile
-			log.Infof("Using config file from LEMMING_CONFIG_FILE environment variable: %s", configFile)
-		}
-	}
 
 	if configFile != "" {
 		// Try to parse user config file (without validation)
@@ -48,7 +40,7 @@ func Load(configFile string) (*configpb.LemmingConfig, error) {
 		if err != nil {
 			// Only fall back to defaults on parsing errors (malformed file)
 			// Not on validation errors (incomplete but well-formed file)
-			defaultConfigFile := getDefaultConfigFile()
+			defaultConfigFile := "configs/lemming_default.textproto"
 			if defaultConfig, defaultErr := loadFromFile(defaultConfigFile); defaultErr == nil {
 				log.Infof("User config parsing failed, using default config file: %s", defaultConfigFile)
 				return defaultConfig, nil
@@ -58,7 +50,7 @@ func Load(configFile string) (*configpb.LemmingConfig, error) {
 		}
 	} else {
 		// Try default config file first
-		defaultConfigFile := getDefaultConfigFile()
+		defaultConfigFile := "configs/lemming_default.textproto"
 		if defaultConfig, defaultErr := loadFromFile(defaultConfigFile); defaultErr == nil {
 			log.Infof("Using default config file: %s", defaultConfigFile)
 			return defaultConfig, nil
@@ -74,14 +66,6 @@ func Load(configFile string) (*configpb.LemmingConfig, error) {
 	}
 
 	return config, nil
-}
-
-// getDefaultConfigFile returns the default config file path with environment variable override support
-func getDefaultConfigFile() string {
-	if envDefaultFile := os.Getenv("LEMMING_DEFAULT_CONFIG_FILE"); envDefaultFile != "" {
-		return envDefaultFile
-	}
-	return "configs/lemming_default.textproto"
 }
 
 // mergeWithDefaults merges user config with defaults for any missing sections
@@ -264,9 +248,6 @@ func validate(config *configpb.LemmingConfig) error {
 // If components section is provided, all required component names must be specified
 func validateComponents(comp *configpb.ComponentConfig) error {
 	// Require critical component names when components section is provided
-	if comp.ChassisName == "" {
-		return fmt.Errorf("chassis name is required")
-	}
 	if comp.Supervisor1Name == "" {
 		return fmt.Errorf("components section requires supervisor1_name to be specified")
 	}
@@ -367,13 +348,6 @@ func validateNetworkSim(netSim *configpb.NetworkSimConfig) error {
 	}
 	if netSim.DefaultTtl < 0 || netSim.DefaultTtl > 255 {
 		return fmt.Errorf("default_ttl must be between 0 and 255, got %d", netSim.DefaultTtl)
-	}
-	// Validate reasonable upper bounds for network simulation
-	if netSim.BaseLatencyMs > 10000 {
-		return fmt.Errorf("base_latency_ms %d exceeds reasonable maximum 10000ms", netSim.BaseLatencyMs)
-	}
-	if netSim.LatencyJitterMs > 5000 {
-		return fmt.Errorf("latency_jitter_ms %d exceeds reasonable maximum 5000ms", netSim.LatencyJitterMs)
 	}
 	return nil
 }
