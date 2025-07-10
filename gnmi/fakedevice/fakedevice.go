@@ -17,7 +17,7 @@ package fakedevice
 import (
 	"context"
 	"fmt"
-	"math/rand/v2"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -40,18 +40,35 @@ const (
 	DefaultNetworkInstance = "DEFAULT"
 	StaticRoutingProtocol  = "DEFAULT"
 	BGPRoutingProtocol     = "BGP"
+
+	// Kill process default
+	defaultRestartTime = 2 * time.Second
+	defaultProcessPID  = 1008
+	defaultMaxPID      = 65535
+
+	// LinkQualification defaults
+	defaultUpdateTicker = 1 * time.Second
+
+	defaultPreSyncDelay = 0 * time.Second
+	defaultSetupTime    = 1 * time.Second
+	defaultTestDuration = 5 * time.Second
+	defaultTeardownTime = 1 * time.Second
+
+	defaultPacketRate = 138888
+	defaultPacketSize = 8184
+
+	// System defaults
+	defaultCPUUser       = 1000000
+	defaultCPUSys        = 500000
+	defaultCPUUtil       = 1
+	defaultMemUsage      = 10485760
+	defaultMemUtil       = 2
+	defaultInterfaceSize = 9000
 )
 
 var (
-	// Thread-safe random source pool for network simulation
-	randPool = sync.Pool{
-		New: func() interface{} {
-			// Create a new random generator with unique seed
-			seed := time.Now().UnixNano()
-			pcg := rand.NewPCG(uint64(seed), uint64(seed>>32))
-			return rand.New(pcg) //nolint:gosec // Using math/rand for network simulation
-		},
-	}
+	randLock sync.Mutex
+	randGen  = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 // PingPacketResult represents the result of a single ping packet
@@ -166,10 +183,10 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 	// Restart logic with 2-second delay if restart=true
 	if restart {
 		go func() {
-			time.Sleep(2 * time.Second)
+			time.Sleep(defaultRestartTime)
 
 			// PID generation for restarted processes
-			newPID, err := generateNewPID(ctx, c, pid, cfg)
+			newPID, err := generateNewPID(ctx, c, pid)
 			if err != nil {
 				log.Errorf("Failed to generate new PID: %v", err)
 				return
@@ -200,11 +217,11 @@ func createDefaultProcess(name string, pid uint32, startTime uint64) *oc.System_
 		Name:              ygot.String(name),
 		Pid:               ygot.Uint64(uint64(pid)),
 		StartTime:         ygot.Uint64(startTime),
-		CpuUsageUser:      ygot.Uint64(1000000),  // 1ms in nanoseconds
-		CpuUsageSystem:    ygot.Uint64(500000),   // 0.5ms in nanoseconds
-		CpuUtilization:    ygot.Uint8(1),         // 1% CPU
-		MemoryUsage:       ygot.Uint64(10485760), // 10MB
-		MemoryUtilization: ygot.Uint8(2),         // 2% memory
+		CpuUsageUser:      ygot.Uint64(defaultCPUUser),
+		CpuUsageSystem:    ygot.Uint64(defaultCPUSys),
+		CpuUtilization:    ygot.Uint8(defaultCPUUtil),
+		MemoryUsage:       ygot.Uint64(defaultMemUsage),
+		MemoryUtilization: ygot.Uint8(defaultMemUtil),
 	}
 }
 
@@ -213,8 +230,6 @@ func PingSimulation(ctx context.Context, destination string, count int32, interv
 	log.Infof("Starting ping simulation to %s with count=%d, interval=%v, wait=%v",
 		destination, count, interval, wait)
 
-	baseLatency := time.Duration(cfg.GetNetworkSim().GetBaseLatencyMs()) * time.Millisecond
-	latencyJitter := time.Duration(cfg.GetNetworkSim().GetLatencyJitterMs()) * time.Millisecond
 	packetLossRate := cfg.GetNetworkSim().GetPacketLossRate()
 	ttl := cfg.GetNetworkSim().GetDefaultTtl()
 
@@ -236,8 +251,8 @@ func PingSimulation(ctx context.Context, destination string, count int32, interv
 			packetCount++
 
 			// Simulate network conditions for this packet
-			networkLatency := simulateLatency(baseLatency, latencyJitter)
-			packetLost := packetLossRate > 0 && shouldDropPacket(packetLossRate)
+			networkLatency := getLatency(cfg)
+			packetLost := packetLossRate > 0 && randGen.Float32() < packetLossRate
 
 			var result *PingPacketResult
 
@@ -580,13 +595,14 @@ func NewInterfaceInitializationTask(cfg *configpb.LemmingConfig) *reconciler.Bui
 				ifIndex     uint32
 			}{
 				{"phy-1/1", "Management interface", 1},
-				{"Ethernet1/2", "Line card port 1", 2},
-				{"Ethernet2/1", "Line card port 2", 3},
-				{"Ethernet2/2", "Line card port 3", 4},
-				{"Ethernet3/1", "High-speed port 1", 5},
-				{"Ethernet3/2", "High-speed port 2", 6},
-				{"Ethernet4/1", "Fabric port 1", 7},
-				{"Ethernet4/2", "Fabric port 2", 8},
+				{"eth1", "Standard Ethernet interface", 2},
+				{"eth2", "Line card port 1", 3},
+				{"eth3", "Line card port 2", 4},
+				{"eth4", "Line card port 3", 5},
+				{"eth5", "High-speed port 1", 6},
+				{"Ethernet3/2", "High-speed port 2", 7},
+				{"Ethernet4/1", "Fabric port 1", 8},
+				{"Ethernet4/2", "Fabric port 2", 9},
 			}
 
 			log.Infof("Initializing %d base network interfaces", len(baseInterfaces))
@@ -600,7 +616,7 @@ func NewInterfaceInitializationTask(cfg *configpb.LemmingConfig) *reconciler.Bui
 					Enabled:     ygot.Bool(true),
 					Description: ygot.String(intfConfig.description),
 					Ifindex:     ygot.Uint32(intfConfig.ifIndex),
-					Mtu:         ygot.Uint16(9000),
+					Mtu:         ygot.Uint16(defaultInterfaceSize),
 					// Initialize with realistic physical interface properties
 					Ethernet: &oc.Interface_Ethernet{
 						PortSpeed:  oc.IfEthernet_ETHERNET_SPEED_SPEED_100GB,
@@ -625,7 +641,7 @@ func NewInterfaceInitializationTask(cfg *configpb.LemmingConfig) *reconciler.Bui
 }
 
 // generateNewPID generates a new unique PID for restarted processes
-func generateNewPID(ctx context.Context, c *ygnmi.Client, excludePID uint32, cfg *configpb.LemmingConfig) (uint32, error) {
+func generateNewPID(ctx context.Context, c *ygnmi.Client, excludePID uint32) (uint32, error) {
 	processes, err := ygnmi.GetAll(ctx, c, ocpath.Root().System().ProcessAny().State())
 	if err != nil {
 		return 0, fmt.Errorf("failed to get existing processes: %v", err)
@@ -641,7 +657,7 @@ func generateNewPID(ctx context.Context, c *ygnmi.Client, excludePID uint32, cfg
 	used[excludePID] = true
 
 	// Use a simple PID range starting from 1008 (after the default processes)
-	for pid := uint32(1008); pid <= 65535; pid++ {
+	for pid := uint32(defaultProcessPID); pid <= defaultMaxPID; pid++ {
 		if !used[pid] {
 			return pid, nil
 		}
@@ -649,51 +665,28 @@ func generateNewPID(ctx context.Context, c *ygnmi.Client, excludePID uint32, cfg
 	return 0, fmt.Errorf("no PID available in range 1008-65535")
 }
 
-// getRandomInt64 returns a random int64 in the range [min, max)
-func getRandomInt64(min, max int64) int64 {
-	// Get a random generator from the pool
-	randGen := randPool.Get().(*rand.Rand)
-	defer randPool.Put(randGen)
-
-	if min >= max {
-		return min
+// getLatency returns a simulated latency based on configured values.
+func getLatency(cfg *configpb.LemmingConfig) time.Duration {
+	if cfg != nil && cfg.GetNetworkSim() != nil {
+		base := cfg.GetNetworkSim().GetBaseLatencyMs()
+		jitter := cfg.GetNetworkSim().GetLatencyJitterMs()
+		if base > 0 {
+			latency := base
+			if jitter > 0 {
+				randLock.Lock()
+				defer randLock.Unlock()
+				// adds a random value between -jitter and +jitter
+				latency += randGen.Int63n(jitter*2) - jitter
+			}
+			return time.Duration(latency) * time.Millisecond
+		}
 	}
-	return randGen.Int64N(max-min) + min
-}
-
-// shouldDropPacket determines if a packet should be dropped based on loss rate
-func shouldDropPacket(lossRate float32) bool {
-	if lossRate <= 0 {
-		return false
-	}
-	if lossRate >= 1.0 {
-		return true
-	}
-	lossPercentage := int64(lossRate * 100)
-	randomPercent := getRandomInt64(0, 100)
-	return randomPercent < lossPercentage
-}
-
-// simulateLatency generates realistic network latency with jitter
-func simulateLatency(baseLatency, jitter time.Duration) time.Duration {
-	if jitter == 0 {
-		return baseLatency
-	}
-	// Generate random jitter between -jitter and +jitter
-	jitterNs := jitter.Nanoseconds()
-	randomJitter := getRandomInt64(-jitterNs, jitterNs+1)
-	finalLatency := baseLatency + time.Duration(randomJitter)
-
-	// Ensure latency is never negative
-	if finalLatency <= 0 {
-		finalLatency = time.Millisecond
-	}
-
-	return finalLatency
+	return 0 * time.Millisecond
 }
 
 // LinkQualificationResult represents the complete state of a link qualification operation
 type LinkQualificationResult struct {
+	mu              sync.Mutex
 	State           plqpb.QualificationState
 	PacketsSent     uint64
 	PacketsReceived uint64
@@ -703,42 +696,21 @@ type LinkQualificationResult struct {
 	EndTime         time.Time
 }
 
-// NetworkImpairments defines configurable network conditions for realistic testing
-type NetworkImpairments struct {
-	PacketLossRate float64       // 0.0-1.0 (0% to 100%)
-	CorruptionRate float64       // Bit error rate causing packet errors
-	JitterRange    time.Duration // Timing variation ±range
-	LatencyBase    time.Duration // Base transmission delay
-}
-
-// QualificationTiming holds all timing parameters for a qualification
-type QualificationTiming struct {
-	SetupDuration    time.Duration
-	TestDuration     time.Duration
-	TeardownDuration time.Duration
-	PreSyncDelay     time.Duration
-	PostSyncDelay    time.Duration
-}
-
 // RunPacketLinkQualification performs a complete packet-based link qualification simulation
-// following the design document state machine and timing requirements
 func RunPacketLinkQualification(
 	ctx context.Context,
 	c *ygnmi.Client,
 	config *plqpb.QualificationConfiguration,
-	updateChan chan<- *LinkQualificationResult,
+	updateCallback func(*LinkQualificationResult),
 	cfg *configpb.LemmingConfig,
-	impairments *NetworkImpairments,
 ) error {
 	qualID := config.GetId()
 	interfaceName := config.GetInterfaceName()
-	log.Infof("Starting packet link qualification %s for interface %s", qualID, interfaceName)
 
-	// Validate interface exists
 	interfacePath := ocpath.Root().Interface(interfaceName)
 	originalInterface, err := ygnmi.Get(ctx, c, interfacePath.State())
 	if err != nil {
-		return fmt.Errorf("interface %s not found: %v", interfaceName, err)
+		return fmt.Errorf("failed to get interface %s: %v", interfaceName, err)
 	}
 	originalOperStatus := originalInterface.GetOperStatus()
 
@@ -749,31 +721,22 @@ func RunPacketLinkQualification(
 	log.Infof("Qualification %s: packet_rate=%d PPS, packet_size=%d bytes, duration=%v",
 		qualID, packetConfig.PacketRate, packetConfig.PacketSize, timing.TestDuration)
 
-	// Initialize qualification state
 	result := &LinkQualificationResult{
 		State:     plqpb.QualificationState_QUALIFICATION_STATE_IDLE,
 		StartTime: time.Now(),
 	}
 
 	// Send initial state
-	select {
-	case updateChan <- result:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	updateCallback(result)
 
-	// Execute qualification state machine
-	if err := executeQualificationStateMachine(ctx, c, interfaceName, result, packetConfig, timing, impairments, updateChan); err != nil {
-		// Mark as error state
+	if err := executeQualificationStateMachine(ctx, c, interfaceName, result, packetConfig, timing, updateCallback, cfg); err != nil {
+		result.mu.Lock()
 		result.State = plqpb.QualificationState_QUALIFICATION_STATE_ERROR
 		result.EndTime = time.Now()
+		result.mu.Unlock()
 
-		select {
-		case updateChan <- result:
-		case <-ctx.Done():
-		}
+		updateCallback(result)
 
-		// Always restore interface state even on error
 		restoreInterfaceOperStatus(c, interfaceName, originalOperStatus)
 		return fmt.Errorf("qualification %s failed: %v", qualID, err)
 	}
@@ -784,17 +747,17 @@ func RunPacketLinkQualification(
 
 // PacketConfiguration holds extracted packet generation parameters
 type PacketConfiguration struct {
-	PacketRate  uint64 // Packets per second
-	PacketSize  uint64 // Bytes per packet
-	IsGenerator bool   // True if this endpoint generates packets
-	IsReflector bool   // True if this endpoint reflects packets
+	PacketRate  uint64
+	PacketSize  uint64
+	IsGenerator bool
+	IsReflector bool
 }
 
 // extractPacketConfiguration extracts packet generation settings from config
 func extractPacketConfiguration(config *plqpb.QualificationConfiguration) *PacketConfiguration {
 	pc := &PacketConfiguration{
-		PacketRate: 1000, // Default 1K PPS
-		PacketSize: 1500, // Default 1500 bytes
+		PacketRate: defaultPacketRate,
+		PacketSize: defaultPacketSize,
 	}
 
 	// Check for packet generator configuration
@@ -808,19 +771,6 @@ func extractPacketConfiguration(config *plqpb.QualificationConfiguration) *Packe
 		}
 	}
 
-	// Check for packet injector configuration
-	if packetInj := config.GetPacketInjector(); packetInj != nil {
-		pc.IsGenerator = true
-		// PacketInjector uses packet_count and we need to calculate rate from duration
-		if packetInj.GetPacketCount() > 0 {
-			// Default to 1K PPS if we can't determine duration
-			pc.PacketRate = 1000
-		}
-		if packetInj.GetPacketSize() > 0 {
-			pc.PacketSize = uint64(packetInj.GetPacketSize())
-		}
-	}
-
 	// Check for reflector configuration
 	if config.GetAsicLoopback() != nil || config.GetPmdLoopback() != nil {
 		pc.IsReflector = true
@@ -829,12 +779,22 @@ func extractPacketConfiguration(config *plqpb.QualificationConfiguration) *Packe
 	return pc
 }
 
+// QualificationTiming holds all timing parameters for a qualification
+type QualificationTiming struct {
+	SetupDuration    time.Duration
+	TestDuration     time.Duration
+	TeardownDuration time.Duration
+	PreSyncDelay     time.Duration
+	PostSyncDelay    time.Duration
+}
+
 // extractQualificationTiming extracts all timing parameters from config
 func extractQualificationTiming(config *plqpb.QualificationConfiguration) *QualificationTiming {
 	timing := &QualificationTiming{
-		SetupDuration:    1 * time.Second, // Default from capabilities
-		TestDuration:     5 * time.Second, // Default test duration
-		TeardownDuration: 1 * time.Second, // Default from capabilities
+		PreSyncDelay:     defaultPreSyncDelay,
+		SetupDuration:    defaultSetupTime,
+		TestDuration:     defaultTestDuration,
+		TeardownDuration: defaultTeardownTime,
 	}
 
 	// Extract timing from RPC synchronization
@@ -855,27 +815,6 @@ func extractQualificationTiming(config *plqpb.QualificationConfiguration) *Quali
 			timing.PostSyncDelay = rpcTiming.GetPostSyncDuration().AsDuration()
 		}
 	}
-
-	// Extract timing from NTP synchronization
-	if ntpTiming := config.GetNtp(); ntpTiming != nil {
-		if ntpTiming.GetStartTime() != nil && ntpTiming.GetEndTime() != nil {
-			// Calculate test duration from start and end times
-			startTime := ntpTiming.GetStartTime().AsTime()
-			endTime := ntpTiming.GetEndTime().AsTime()
-			if endTime.After(startTime) {
-				timing.TestDuration = endTime.Sub(startTime)
-			}
-		}
-		if ntpTiming.GetTeardownTime() != nil && ntpTiming.GetEndTime() != nil {
-			// Calculate teardown duration from end time to teardown time
-			endTime := ntpTiming.GetEndTime().AsTime()
-			teardownTime := ntpTiming.GetTeardownTime().AsTime()
-			if teardownTime.After(endTime) {
-				timing.TeardownDuration = teardownTime.Sub(endTime)
-			}
-		}
-	}
-
 	return timing
 }
 
@@ -887,30 +826,28 @@ func executeQualificationStateMachine(
 	result *LinkQualificationResult,
 	packetConfig *PacketConfiguration,
 	timing *QualificationTiming,
-	impairments *NetworkImpairments,
-	updateChan chan<- *LinkQualificationResult,
+	updateCallback func(*LinkQualificationResult),
+	cfg *configpb.LemmingConfig,
 ) error {
-	// Pre-sync delay (for coordination with peer)
-	if timing.PreSyncDelay > 0 {
-		log.Infof("Waiting pre-sync delay: %v", timing.PreSyncDelay)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(timing.PreSyncDelay):
-		}
+	// Pre-sync delay
+	log.Infof("Waiting pre-sync delay: %v", timing.PreSyncDelay)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(timing.PreSyncDelay):
 	}
 
 	// SETUP phase: Configure interface and prepare for qualification
-	if err := executeSetupPhase(ctx, c, interfaceName, result, timing, updateChan); err != nil {
+	if err := executeSetupPhase(ctx, c, interfaceName, result, timing, updateCallback); err != nil {
 		return fmt.Errorf("setup phase failed: %v", err)
 	}
 
 	// RUNNING phase: Execute packet transmission/reception simulation
-	if err := executeRunningPhase(ctx, result, packetConfig, timing, impairments, updateChan); err != nil {
+	if err := executeRunningPhase(ctx, result, packetConfig, timing, updateCallback, cfg); err != nil {
 		return fmt.Errorf("running phase failed: %v", err)
 	}
 
-	// Post-sync delay (for coordination with peer)
+	// Post-sync delay
 	if timing.PostSyncDelay > 0 {
 		log.Infof("Waiting post-sync delay: %v", timing.PostSyncDelay)
 		select {
@@ -921,19 +858,17 @@ func executeQualificationStateMachine(
 	}
 
 	// TEARDOWN phase: Restore interface configuration
-	if err := executeTeardownPhase(ctx, c, interfaceName, result, timing, updateChan); err != nil {
+	if err := executeTeardownPhase(ctx, c, interfaceName, result, timing, updateCallback); err != nil {
 		return fmt.Errorf("teardown phase failed: %v", err)
 	}
 
 	// COMPLETED phase: Final state
+	result.mu.Lock()
 	result.State = plqpb.QualificationState_QUALIFICATION_STATE_COMPLETED
 	result.EndTime = time.Now()
+	result.mu.Unlock()
 
-	select {
-	case updateChan <- result:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	updateCallback(result)
 
 	return nil
 }
@@ -945,10 +880,12 @@ func executeSetupPhase(
 	interfaceName string,
 	result *LinkQualificationResult,
 	timing *QualificationTiming,
-	updateChan chan<- *LinkQualificationResult,
+	updateCallback func(*LinkQualificationResult),
 ) error {
 	log.Infof("Entering SETUP phase for %v", timing.SetupDuration)
+	result.mu.Lock()
 	result.State = plqpb.QualificationState_QUALIFICATION_STATE_SETUP
+	result.mu.Unlock()
 
 	// Set interface to TESTING state
 	timestampedCtx := gnmi.AddTimestampMetadata(ctx, time.Now().UnixNano())
@@ -957,11 +894,7 @@ func executeSetupPhase(
 	}
 
 	// Send state update
-	select {
-	case updateChan <- result:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	updateCallback(result)
 
 	// Wait for setup duration
 	select {
@@ -979,22 +912,20 @@ func executeRunningPhase(
 	result *LinkQualificationResult,
 	packetConfig *PacketConfiguration,
 	timing *QualificationTiming,
-	impairments *NetworkImpairments,
-	updateChan chan<- *LinkQualificationResult,
+	updateCallback func(*LinkQualificationResult),
+	cfg *configpb.LemmingConfig,
 ) error {
 	log.Infof("Entering RUNNING phase for %v", timing.TestDuration)
+	result.mu.Lock()
 	result.State = plqpb.QualificationState_QUALIFICATION_STATE_RUNNING
+	result.mu.Unlock()
 
 	// Send state update
-	select {
-	case updateChan <- result:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	updateCallback(result)
 
 	// Start packet simulation
 	startTime := time.Now()
-	updateTicker := time.NewTicker(1 * time.Second) // Update stats every second
+	updateTicker := time.NewTicker(defaultUpdateTicker)
 	defer updateTicker.Stop()
 
 	for {
@@ -1004,15 +935,15 @@ func executeRunningPhase(
 		case <-updateTicker.C:
 			elapsed := time.Since(startTime)
 
-			// Update packet statistics based on elapsed time
-			updatePacketStatistics(result, packetConfig, elapsed, impairments)
+			// Update packet statistics based on endpoint type
+			if packetConfig.IsGenerator {
+				updateGeneratorStatistics(result, packetConfig, elapsed, cfg)
+			} else if packetConfig.IsReflector {
+				updateReflectorStatistics(result, elapsed, cfg)
+			}
 
 			// Send periodic update
-			select {
-			case updateChan <- result:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+			updateCallback(result)
 
 			// Check if test duration completed
 			if elapsed >= timing.TestDuration {
@@ -1030,17 +961,15 @@ func executeTeardownPhase(
 	interfaceName string,
 	result *LinkQualificationResult,
 	timing *QualificationTiming,
-	updateChan chan<- *LinkQualificationResult,
+	updateCallback func(*LinkQualificationResult),
 ) error {
 	log.Infof("Entering TEARDOWN phase for %v", timing.TeardownDuration)
+	result.mu.Lock()
 	result.State = plqpb.QualificationState_QUALIFICATION_STATE_TEARDOWN
+	result.mu.Unlock()
 
 	// Send state update
-	select {
-	case updateChan <- result:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	updateCallback(result)
 
 	// Wait for teardown duration
 	select {
@@ -1048,30 +977,9 @@ func executeTeardownPhase(
 		return ctx.Err()
 	case <-time.After(timing.TeardownDuration):
 		log.Infof("TEARDOWN phase completed")
-		// Restore interface to UP state
 		restoreInterfaceOperStatus(c, interfaceName, oc.Interface_OperStatus_UP)
 		return nil
 	}
-}
-
-// updatePacketStatistics calculates realistic packet statistics with impairments
-func updatePacketStatistics(
-	result *LinkQualificationResult,
-	packetConfig *PacketConfiguration,
-	elapsed time.Duration,
-	impairments *NetworkImpairments,
-) {
-	// Calculate expected packets based on rate and elapsed time
-	expectedPackets := uint64(elapsed.Seconds()) * packetConfig.PacketRate
-
-	// Apply network impairments for realistic simulation
-	sent, received, dropped, errors := simulatePacketTransmissionWithImpairments(expectedPackets, impairments)
-
-	// Update stats atomically
-	result.PacketsSent = sent
-	result.PacketsReceived = received
-	result.PacketsDropped = dropped
-	result.PacketsError = errors
 }
 
 // restoreInterfaceOperStatus restores interface to original operational state
@@ -1084,65 +992,57 @@ func restoreInterfaceOperStatus(c *ygnmi.Client, interfaceName string, originalS
 	}
 }
 
-// simulatePacketTransmissionWithImpairments applies realistic network conditions
-func simulatePacketTransmissionWithImpairments(expectedPackets uint64, impairments *NetworkImpairments) (sent, received, dropped, errors uint64) {
-	sent = expectedPackets
+// updateGeneratorStatistics calculates realistic packet statistics for a generator
+func updateGeneratorStatistics(
+	result *LinkQualificationResult,
+	packetConfig *PacketConfiguration,
+	elapsed time.Duration,
+	cfg *configpb.LemmingConfig,
+) {
+	result.mu.Lock()
+	defer result.mu.Unlock()
 
-	// Apply packet loss first
-	lossCount := uint64(float64(sent) * impairments.PacketLossRate)
-	if lossCount > sent {
-		lossCount = sent
-	}
-	dropped = lossCount
+	// Calculate expected packets based on rate and elapsed time
+	expectedPackets := uint64(elapsed.Seconds()) * packetConfig.PacketRate
 
-	// Apply packet corruption to remaining packets (results in errors)
-	remainingPackets := sent - dropped
-	errorCount := uint64(float64(remainingPackets) * impairments.CorruptionRate)
-	if errorCount > remainingPackets {
-		errorCount = remainingPackets
-	}
-	errors = errorCount
-
-	// Successfully received packets (after loss and corruption)
-	received = remainingPackets - errors
-
-	// Add small realistic variance (±0.1% for network jitter) but maintain conservation
-	// Get a random generator from the pool
-	randGen := randPool.Get().(*rand.Rand)
-	defer randPool.Put(randGen)
-
-	variance := int64(float64(received) * 0.001)
-	if variance > 0 {
-		adjustment := randGen.Int64N(variance*2) - variance
-		newReceived := int64(received) + adjustment
-
-		// Ensure we don't violate packet conservation
-		maxReceived := int64(sent - dropped - errors)
-		if newReceived > maxReceived {
-			newReceived = maxReceived
-		}
-		if newReceived < 0 {
-			newReceived = 0
-		}
-
-		// Adjust dropped/error counts to maintain conservation
-		oldReceived := received
-		received = uint64(newReceived)
-
-		// If we reduced received, the difference goes to dropped
-		if received < oldReceived {
-			dropped += oldReceived - received
-		}
+	var dropped uint64
+	if cfg != nil && cfg.GetNetworkSim() != nil {
+		lossRate := cfg.GetNetworkSim().GetPacketLossRate()
+		dropped = uint64(float64(expectedPackets) * float64(lossRate))
 	}
 
-	// Final verification: ensure packet conservation
-	if sent != received+dropped+errors {
-		// If conservation is violated, fix by adjusting dropped count
-		expected := received + dropped + errors
-		if expected != sent {
-			dropped = sent - received - errors
-		}
+	// For a generator, it sends packets and receives responses
+	result.PacketsSent = expectedPackets
+	result.PacketsDropped = dropped
+	result.PacketsError = 0 // Keep simple for now
+	result.PacketsReceived = expectedPackets - dropped
+}
+
+// updateReflectorStatistics calculates realistic packet statistics for a reflector
+func updateReflectorStatistics(
+	result *LinkQualificationResult,
+	elapsed time.Duration,
+	cfg *configpb.LemmingConfig,
+) {
+	result.mu.Lock()
+	defer result.mu.Unlock()
+
+	// For a reflector, assume it receives packets at a certain rate
+	// and reflects them back (this is a simulation of what it would receive)
+	expectedIncomingRate := uint64(defaultPacketRate) // Use default rate as baseline
+	expectedReceived := uint64(elapsed.Seconds()) * expectedIncomingRate
+
+	var dropped uint64
+	if cfg != nil && cfg.GetNetworkSim() != nil {
+		lossRate := cfg.GetNetworkSim().GetPacketLossRate()
+		dropped = uint64(float64(expectedReceived) * float64(lossRate))
 	}
 
-	return sent, received, dropped, errors
+	receivedPackets := expectedReceived - dropped
+
+	// Reflector reflects back what it receives
+	result.PacketsReceived = receivedPackets
+	result.PacketsSent = receivedPackets // Reflects back what it receives
+	result.PacketsDropped = dropped
+	result.PacketsError = 0 // Keep simple for now
 }

@@ -17,8 +17,8 @@ package gnoi
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
-	"strings"
 	"sync"
 	"time"
 
@@ -59,9 +59,22 @@ const (
 
 	// Ping simulation default values
 	defaultPingCount    = 5          // Default number of ping packets
-	defaultPingInterval = 1000000000 // Default interval between packets (1 second in nanoseconds)
-	defaultPingWait     = 2000000000 // Default wait time for response (2 seconds in nanoseconds)
+	defaultPingInterval = 1000000000 // Default interval between packets (1 second)
+	defaultPingWait     = 2000000000 // Default wait time for response (2 seconds)
 	defaultPingSize     = 56         // Default packet size in bytes (standard ping size)
+
+	// LinkQualification default values
+	defaultMaxHistoricalResults = 10
+	defaultPacketSize           = 1500
+
+	// Capability default values
+	defaultMaxBps           = 400000000000 // 400 Gbps
+	defaultMaxPps           = 500000000    // 500M PPS
+	defaultMinMtu           = 64
+	defaultMaxMtu           = 9000
+	defaultMinSetupDuration = 1 * time.Second
+	defaultMinTeardown      = 1 * time.Second
+	defaultMinSample        = 10 * time.Second
 )
 
 type bgp struct {
@@ -109,23 +122,18 @@ type linkQualification struct {
 
 	c      *ygnmi.Client
 	config *configpb.LemmingConfig
-
-	// Multi-port operation support
-	mu              sync.RWMutex
-	operationTests  map[string][]*QualificationState // op_id -> states
-	qualifications  map[string]*QualificationState   // qual_id -> state (for individual lookup)
-	interfaceToTest map[string]string                // interface -> current_op_id
-	capabilities    *plqpb.CapabilitiesResponse
+	mu     sync.RWMutex
+	// Qualification state tracking
+	qualifications map[string]*QualificationState // qual_id -> state
 
 	// Historical results tracking per interface
 	historicalResults map[string][]*plqpb.QualificationResult // interface -> historical results
 	maxHistorical     uint64
 }
 
-// QualificationState represents the state of a single qualification in an operation
+// QualificationState represents the state of a single qualification
 type QualificationState struct {
 	ID            string
-	OperationID   string // For grouping multi-port operations
 	InterfaceName string
 	State         plqpb.QualificationState
 	StartTime     time.Time
@@ -146,39 +154,50 @@ type QualificationState struct {
 	cancelCh chan struct{}
 	done     bool
 	mu       sync.Mutex // Protect individual state updates
-
-	// Network impairments simulation
-	impairments *fakedevice.NetworkImpairments
-
-	// For generator-reflector coordination
-	pairedQualID string // ID of paired qualification (for generator-reflector pairs)
 }
 
 func newLinkQualification(c *ygnmi.Client, config *configpb.LemmingConfig) *linkQualification {
 	return &linkQualification{
 		c:                 c,
 		config:            config,
-		operationTests:    make(map[string][]*QualificationState),
 		qualifications:    make(map[string]*QualificationState),
-		interfaceToTest:   make(map[string]string),
 		historicalResults: make(map[string][]*plqpb.QualificationResult),
-		capabilities:      buildCapabilities(),
-		maxHistorical:     10, // Default max historical results
+		maxHistorical:     defaultMaxHistoricalResults,
 	}
 }
 
 // Capabilities returns the capabilities of the LinkQualification service
 func (lq *linkQualification) Capabilities(ctx context.Context, req *plqpb.CapabilitiesRequest) (*plqpb.CapabilitiesResponse, error) {
 	log.Infof("Received LinkQualification Capabilities request")
-	// Create a new capabilities response with current timestamp
-	response := &plqpb.CapabilitiesResponse{
-		Time:                             timestamppb.Now(),
-		NtpSynced:                        lq.capabilities.NtpSynced,
-		Generator:                        lq.capabilities.Generator,
-		Reflector:                        lq.capabilities.Reflector,
-		MaxHistoricalResultsPerInterface: lq.capabilities.MaxHistoricalResultsPerInterface,
-	}
-	return response, nil
+
+	return &plqpb.CapabilitiesResponse{
+		Time:      timestamppb.Now(),
+		NtpSynced: true,
+		Generator: &plqpb.GeneratorCapabilities{
+			PacketGenerator: &plqpb.PacketGeneratorCapabilities{
+				MaxBps:              defaultMaxBps,
+				MaxPps:              defaultMaxPps,
+				MinMtu:              defaultMinMtu,
+				MaxMtu:              defaultMaxMtu,
+				MinSetupDuration:    durationpb.New(defaultMinSetupDuration),
+				MinTeardownDuration: durationpb.New(defaultMinTeardown),
+				MinSampleInterval:   durationpb.New(defaultMinSample),
+			},
+			// PacketInjector intentionally omitted - unimplemented in simulation
+		},
+		Reflector: &plqpb.ReflectorCapabilities{
+			AsicLoopback: &plqpb.AsicLoopbackCapabilities{
+				MinSetupDuration:    durationpb.New(defaultMinSetupDuration),
+				MinTeardownDuration: durationpb.New(defaultMinTeardown),
+				Fields:              []plqpb.HeaderMatchField{plqpb.HeaderMatchField_HEADER_MATCH_FIELD_L2},
+			},
+			PmdLoopback: &plqpb.PmdLoopbackCapabilities{
+				MinSetupDuration:    durationpb.New(defaultMinSetupDuration),
+				MinTeardownDuration: durationpb.New(defaultMinTeardown),
+			},
+		},
+		MaxHistoricalResultsPerInterface: defaultMaxHistoricalResults,
+	}, nil
 }
 
 // Create starts link qualification on specified interfaces with multi-port support
@@ -192,10 +211,6 @@ func (lq *linkQualification) Create(ctx context.Context, req *plqpb.CreateReques
 	lq.mu.Lock()
 	defer lq.mu.Unlock()
 
-	// Generate operation ID for this batch request
-	operationID := fmt.Sprintf("op_%d_%d", time.Now().UnixNano(), len(req.GetInterfaces()))
-	log.Infof("Generated operation ID: %s", operationID)
-
 	// Batch validation - validate ALL interfaces before starting ANY
 	validationErrors := make(map[string]*rpc.Status)
 	qualificationStates := make([]*QualificationState, 0, len(req.GetInterfaces()))
@@ -203,10 +218,6 @@ func (lq *linkQualification) Create(ctx context.Context, req *plqpb.CreateReques
 	// Track IDs and interfaces within this request to detect duplicates
 	requestIDs := make(map[string]bool)
 	requestInterfaces := make(map[string]bool)
-
-	// Track generators and reflectors for pairing
-	generators := make([]*plqpb.QualificationConfiguration, 0)
-	reflectors := make([]*plqpb.QualificationConfiguration, 0)
 
 	for _, config := range req.GetInterfaces() {
 		if config.GetId() == "" {
@@ -235,17 +246,8 @@ func (lq *linkQualification) Create(ctx context.Context, req *plqpb.CreateReques
 			continue
 		}
 
-		// Mark as seen in this request
 		requestIDs[id] = true
 		requestInterfaces[interfaceName] = true
-
-		// Track generators and reflectors
-		switch config.GetEndpointType().(type) {
-		case *plqpb.QualificationConfiguration_PacketGenerator, *plqpb.QualificationConfiguration_PacketInjector:
-			generators = append(generators, config)
-		case *plqpb.QualificationConfiguration_AsicLoopback, *plqpb.QualificationConfiguration_PmdLoopback:
-			reflectors = append(reflectors, config)
-		}
 
 		// Validate against existing state and configuration
 		if err := lq.validateQualificationConfig(config); err != nil {
@@ -262,49 +264,20 @@ func (lq *linkQualification) Create(ctx context.Context, req *plqpb.CreateReques
 			}
 		} else {
 			// Create qualification state for valid configs
-			qualState := lq.createQualificationState(config, operationID)
+			qualState := lq.createQualificationState(config)
 			qualificationStates = append(qualificationStates, qualState)
 		}
 	}
 
-	// Set up generator-reflector pairing if applicable
-	if len(generators) == 1 && len(reflectors) == 1 && len(validationErrors) == 0 {
-		// Simple pairing case: one generator, one reflector
-		for i := range qualificationStates {
-			if qualificationStates[i].IsGenerator {
-				for j := range qualificationStates {
-					if qualificationStates[j].IsReflector {
-						qualificationStates[i].pairedQualID = qualificationStates[j].ID
-						qualificationStates[j].pairedQualID = qualificationStates[i].ID
-						log.Infof("Paired generator %s with reflector %s", qualificationStates[i].ID, qualificationStates[j].ID)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// Build response with both successful qualifications and validation errors
 	response := &plqpb.CreateResponse{
 		Status: make(map[string]*rpc.Status),
 	}
+	maps.Copy(response.Status, validationErrors)
 
-	// Add validation errors to response first
-	for id, errorStatus := range validationErrors {
-		response.Status[id] = errorStatus
-	}
-
-	// Only proceed with creating qualifications if we have valid ones
+	// Proceed with creating qualifications if we have valid ones
 	if len(qualificationStates) > 0 {
-		// Store valid qualifications in operation group
-		lq.operationTests[operationID] = qualificationStates
-
-		// Store individual qualification mappings
 		for _, qualState := range qualificationStates {
 			lq.qualifications[qualState.ID] = qualState
-			lq.interfaceToTest[qualState.InterfaceName] = operationID
-
-			// Only add OK status if there's no validation error for this ID
 			if _, hasError := validationErrors[qualState.ID]; !hasError {
 				response.Status[qualState.ID] = &rpc.Status{
 					Code:    int32(codes.OK),
@@ -313,12 +286,14 @@ func (lq *linkQualification) Create(ctx context.Context, req *plqpb.CreateReques
 			}
 		}
 
-		// Start coordinated multi-port qualification
-		go lq.executeOperationGroup(ctx, operationID, qualificationStates)
+		// Start individual qualifications
+		for _, qualState := range qualificationStates {
+			go lq.executeQualification(context.Background(), qualState)
+		}
 	}
 
-	log.Infof("Created operation %s with %d valid qualifications, %d validation errors",
-		operationID, len(qualificationStates), len(validationErrors))
+	log.Infof("Created %d valid qualifications, %d validation errors",
+		len(qualificationStates), len(validationErrors))
 
 	return response, nil
 }
@@ -329,6 +304,11 @@ func (lq *linkQualification) Get(ctx context.Context, req *plqpb.GetRequest) (*p
 
 	if len(req.GetIds()) == 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "no qualification ids specified")
+	}
+
+	// Check if context is cancelled
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 
 	response := &plqpb.GetResponse{
@@ -343,8 +323,11 @@ func (lq *linkQualification) Get(ctx context.Context, req *plqpb.GetRequest) (*p
 		if !exists {
 			// Return NOT_FOUND result for missing qualifications
 			response.Results[id] = &plqpb.QualificationResult{
-				Id:    id,
-				State: plqpb.QualificationState_QUALIFICATION_STATE_ERROR,
+				Id:            id,
+				InterfaceName: "", // Unknown interface for non-existent qualification
+				State:         plqpb.QualificationState_QUALIFICATION_STATE_ERROR,
+				StartTime:     timestamppb.Now(), // Set to current time
+				EndTime:       timestamppb.Now(),
 				Status: &rpc.Status{
 					Code:    int32(codes.NotFound),
 					Message: fmt.Sprintf("qualification %s not found", id),
@@ -353,71 +336,113 @@ func (lq *linkQualification) Get(ctx context.Context, req *plqpb.GetRequest) (*p
 			continue
 		}
 
-		// Convert internal state to protobuf result
+		qualState.mu.Lock()
+		snapshot := struct {
+			ID              string
+			InterfaceName   string
+			State           plqpb.QualificationState
+			StartTime       time.Time
+			EndTime         time.Time
+			PacketsSent     uint64
+			PacketsReceived uint64
+			PacketsDropped  uint64
+			PacketsError    uint64
+			Config          *plqpb.QualificationConfiguration
+			done            bool
+		}{
+			ID:              qualState.ID,
+			InterfaceName:   qualState.InterfaceName,
+			State:           qualState.State,
+			StartTime:       qualState.StartTime,
+			EndTime:         qualState.EndTime,
+			PacketsSent:     qualState.PacketsSent,
+			PacketsReceived: qualState.PacketsReceived,
+			PacketsDropped:  qualState.PacketsDropped,
+			PacketsError:    qualState.PacketsError,
+			Config:          qualState.Config,
+			done:            qualState.done,
+		}
+		qualState.mu.Unlock()
+
+		// Convert snapshot to protobuf result
 		result := &plqpb.QualificationResult{
-			Id:            qualState.ID,
-			InterfaceName: qualState.InterfaceName,
-			State:         qualState.State,
-			StartTime:     timestamppb.New(qualState.StartTime),
+			Id:              snapshot.ID,
+			InterfaceName:   snapshot.InterfaceName,
+			State:           snapshot.State,
+			StartTime:       timestamppb.New(snapshot.StartTime),
+			PacketsSent:     snapshot.PacketsSent,
+			PacketsReceived: snapshot.PacketsReceived,
+			PacketsDropped:  snapshot.PacketsDropped,
+			PacketsError:    snapshot.PacketsError,
 		}
 
-		// Add end time and packet stats if qualification is completed
-		if qualState.done {
-			result.EndTime = timestamppb.New(qualState.EndTime)
-			result.PacketsSent = qualState.PacketsSent
-			result.PacketsReceived = qualState.PacketsReceived
-			result.PacketsDropped = qualState.PacketsDropped
-			result.PacketsError = qualState.PacketsError
+		// Add end time - use actual end time if done, current time if ongoing
+		if snapshot.done {
+			result.EndTime = timestamppb.New(snapshot.EndTime)
+		} else {
+			result.EndTime = timestamppb.Now()
+		}
 
-			// Calculate realistic rate based on configuration and impairments
-			duration := qualState.EndTime.Sub(qualState.StartTime)
-			if duration > 0 && qualState.PacketsSent > 0 {
-				// Get packet size from configuration, default to 1500 bytes
-				packetSize := uint64(1500) // Default
-				if packetGen := qualState.Config.GetPacketGenerator(); packetGen != nil {
+		// Calculate rates if we have packet data
+		if snapshot.PacketsSent > 0 {
+			var duration time.Duration
+			if snapshot.done {
+				duration = snapshot.EndTime.Sub(snapshot.StartTime)
+			} else {
+				duration = time.Since(snapshot.StartTime)
+			}
+
+			if duration > 0 {
+				// Get packet size from configuration, default to 1500 bytes (standard default)
+				packetSize := uint64(defaultPacketSize)
+				if packetGen := snapshot.Config.GetPacketGenerator(); packetGen != nil {
 					if packetGen.GetPacketSize() > 0 {
 						packetSize = uint64(packetGen.GetPacketSize())
 					}
-				} else if packetInj := qualState.Config.GetPacketInjector(); packetInj != nil {
-					if packetInj.GetPacketSize() > 0 {
-						packetSize = uint64(packetInj.GetPacketSize())
-					}
 				}
 
-				// ExpectedRateBytesPerSecond should be the configured theoretical rate
-				// (packet_rate * packet_size), not the observed rate
-				if packetGen := qualState.Config.GetPacketGenerator(); packetGen != nil {
-					configuredRate := uint64(packetGen.GetPacketRate())
-					result.ExpectedRateBytesPerSecond = configuredRate * packetSize
-				} else if packetInj := qualState.Config.GetPacketInjector(); packetInj != nil {
-					// PacketInjector uses packet count, so calculate rate from test duration
-					if duration.Seconds() > 0 {
-						packetRate := uint64(packetInj.GetPacketCount()) / uint64(duration.Seconds())
-						result.ExpectedRateBytesPerSecond = packetRate * packetSize
+				durationSeconds := duration.Seconds()
+				if durationSeconds > 0 {
+					// ExpectedRateBytesPerSecond should be the configured theoretical rate
+					if packetGen := snapshot.Config.GetPacketGenerator(); packetGen != nil {
+						configuredRate := packetGen.GetPacketRate()
+						// Check for potential overflow
+						if configuredRate > 0 && packetSize > 0 && configuredRate <= math.MaxUint64/packetSize {
+							result.ExpectedRateBytesPerSecond = configuredRate * packetSize
+						}
+					} else {
+						// For non-generator endpoints, calculate based on sent packets and duration
+						totalBytes := snapshot.PacketsSent * packetSize
+						if totalBytes > 0 {
+							result.ExpectedRateBytesPerSecond = totalBytes / uint64(durationSeconds)
+						}
 					}
-				} else {
-					// For non-generator endpoints, calculate based on sent packets and duration
-					totalBytes := qualState.PacketsSent * packetSize
-					result.ExpectedRateBytesPerSecond = totalBytes / uint64(duration.Seconds())
+
+					// Account for packet loss in actual rate calculation
+					actualBytes := snapshot.PacketsReceived * packetSize
+					if actualBytes > 0 {
+						result.QualificationRateBytesPerSecond = actualBytes / uint64(durationSeconds)
+					}
+
+					// Safe logging - avoid division by zero
+					var lossPercent float64
+					if snapshot.PacketsSent > 0 {
+						lossPercent = float64(snapshot.PacketsDropped) / float64(snapshot.PacketsSent) * 100
+					}
+					log.Infof("Calculated rates for qualification %s: packet_size=%d, expected_rate=%d Bps, actual_rate=%d Bps, loss=%.4f%%",
+						snapshot.ID, packetSize,
+						result.ExpectedRateBytesPerSecond, result.QualificationRateBytesPerSecond,
+						lossPercent)
 				}
-
-				// Account for packet loss in actual rate calculation
-				actualBytes := qualState.PacketsReceived * packetSize
-				result.QualificationRateBytesPerSecond = actualBytes / uint64(duration.Seconds())
-
-				log.Infof("Calculated rates for qualification %s (op_id=%s): packet_size=%d, expected_rate=%d Bps, actual_rate=%d Bps, loss=%.4f%%",
-					qualState.ID, qualState.OperationID, packetSize,
-					result.ExpectedRateBytesPerSecond, result.QualificationRateBytesPerSecond,
-					float64(qualState.PacketsDropped)/float64(qualState.PacketsSent)*100)
 			}
-		} else {
-			result.EndTime = timestamppb.Now() // Current time for ongoing qualifications
 		}
 
-		// Add successful status
-		result.Status = &rpc.Status{
-			Code:    int32(codes.OK),
-			Message: "qualification result retrieved successfully",
+		// Set status field for ERROR states (using snapshot to avoid race conditions)
+		if snapshot.State == plqpb.QualificationState_QUALIFICATION_STATE_ERROR {
+			result.Status = &rpc.Status{
+				Code:    int32(codes.Internal),
+				Message: "qualification encountered an error",
+			}
 		}
 
 		response.Results[id] = result
@@ -434,15 +459,17 @@ func (lq *linkQualification) Delete(ctx context.Context, req *plqpb.DeleteReques
 		return nil, status.Errorf(codes.InvalidArgument, "no qualification ids specified")
 	}
 
+	// Check if context is cancelled
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
 	response := &plqpb.DeleteResponse{
 		Results: make(map[string]*rpc.Status),
 	}
 
 	lq.mu.Lock()
 	defer lq.mu.Unlock()
-
-	// Track operations to clean up
-	operationsToCleanup := make(map[string]bool)
 
 	for _, id := range req.GetIds() {
 		qualState, exists := lq.qualifications[id]
@@ -454,52 +481,112 @@ func (lq *linkQualification) Delete(ctx context.Context, req *plqpb.DeleteReques
 			continue
 		}
 
+		// Create a snapshot of the qualification state under lock
+		qualState.mu.Lock()
+		snapshot := struct {
+			ID              string
+			InterfaceName   string
+			State           plqpb.QualificationState
+			StartTime       time.Time
+			EndTime         time.Time
+			PacketsSent     uint64
+			PacketsReceived uint64
+			PacketsDropped  uint64
+			PacketsError    uint64
+			Config          *plqpb.QualificationConfiguration
+			done            bool
+		}{
+			ID:              qualState.ID,
+			InterfaceName:   qualState.InterfaceName,
+			State:           qualState.State,
+			StartTime:       qualState.StartTime,
+			EndTime:         qualState.EndTime,
+			PacketsSent:     qualState.PacketsSent,
+			PacketsReceived: qualState.PacketsReceived,
+			PacketsDropped:  qualState.PacketsDropped,
+			PacketsError:    qualState.PacketsError,
+			Config:          qualState.Config,
+			done:            qualState.done,
+		}
+
 		// Cancel ongoing qualification if not completed
-		if !qualState.done {
+		// Per proto spec: "If the qualification is not in QUALIFICATION_STATE_COMPLETED or QUALIFICATION_STATE_ERROR,
+		// the qualification will be canceled then deleted"
+		var cancellationFailed bool
+		if !snapshot.done && snapshot.State != plqpb.QualificationState_QUALIFICATION_STATE_COMPLETED &&
+			snapshot.State != plqpb.QualificationState_QUALIFICATION_STATE_ERROR {
+
+			// Try to send cancellation signal
 			select {
 			case qualState.cancelCh <- struct{}{}:
 				log.Infof("Sent cancellation signal for qualification %s", id)
+				// Update state to reflect cancellation
+				qualState.done = true
+				qualState.State = plqpb.QualificationState_QUALIFICATION_STATE_ERROR
+				qualState.EndTime = time.Now()
+				// Update snapshot to reflect the cancellation
+				snapshot.done = true
+				snapshot.State = plqpb.QualificationState_QUALIFICATION_STATE_ERROR
+				snapshot.EndTime = time.Now()
 			default:
-				// Channel already has a message or qualification completed
+				// Channel is full or closed - cancellation failed
+				cancellationFailed = true
+				log.Warningf("Failed to send cancellation signal for qualification %s - channel full or closed", id)
 			}
-			qualState.done = true
-			qualState.State = plqpb.QualificationState_QUALIFICATION_STATE_ERROR
-			qualState.EndTime = time.Now()
+		}
+		qualState.mu.Unlock()
 
-			// Interface state restoration will be handled by fakedevice simulation
+		// Handle cancellation failure per proto spec
+		if cancellationFailed {
+			response.Results[id] = &rpc.Status{
+				Code:    int32(codes.FailedPrecondition),
+				Message: fmt.Sprintf("qualification %s cannot be stopped", id),
+			}
+			continue
 		}
 
 		// Store completed qualification in historical results if it completed successfully
-		if qualState.State == plqpb.QualificationState_QUALIFICATION_STATE_COMPLETED {
-			interfaceName := qualState.InterfaceName
+		if snapshot.State == plqpb.QualificationState_QUALIFICATION_STATE_COMPLETED {
+			interfaceName := snapshot.InterfaceName
 
 			// Create qualification result for historical storage
 			result := &plqpb.QualificationResult{
-				Id:              qualState.ID,
+				Id:              snapshot.ID,
 				InterfaceName:   interfaceName,
-				State:           qualState.State,
-				StartTime:       timestamppb.New(qualState.StartTime),
-				EndTime:         timestamppb.New(qualState.EndTime),
-				PacketsSent:     qualState.PacketsSent,
-				PacketsReceived: qualState.PacketsReceived,
-				PacketsDropped:  qualState.PacketsDropped,
-				PacketsError:    qualState.PacketsError,
+				State:           snapshot.State,
+				StartTime:       timestamppb.New(snapshot.StartTime),
+				EndTime:         timestamppb.New(snapshot.EndTime),
+				PacketsSent:     snapshot.PacketsSent,
+				PacketsReceived: snapshot.PacketsReceived,
+				PacketsDropped:  snapshot.PacketsDropped,
+				PacketsError:    snapshot.PacketsError,
 			}
 
-			// Calculate rates if qualification completed with data
-			if qualState.PacketsSent > 0 {
-				duration := qualState.EndTime.Sub(qualState.StartTime)
+			// Calculate rates if qualification completed with data - with overflow protection
+			if snapshot.PacketsSent > 0 {
+				duration := snapshot.EndTime.Sub(snapshot.StartTime)
 				if duration > 0 {
-					packetSize := uint64(1500) // Default
-					if packetGen := qualState.Config.GetPacketGenerator(); packetGen != nil && packetGen.GetPacketSize() > 0 {
+					packetSize := uint64(defaultPacketSize)
+					if packetGen := snapshot.Config.GetPacketGenerator(); packetGen != nil && packetGen.GetPacketSize() > 0 {
 						packetSize = uint64(packetGen.GetPacketSize())
 					}
 
-					// Calculate expected and actual rates
-					if packetGen := qualState.Config.GetPacketGenerator(); packetGen != nil {
-						result.ExpectedRateBytesPerSecond = packetGen.GetPacketRate() * packetSize
+					durationSeconds := duration.Seconds()
+					if durationSeconds > 0 {
+						// Calculate expected rate with overflow protection
+						if packetGen := snapshot.Config.GetPacketGenerator(); packetGen != nil {
+							configuredRate := packetGen.GetPacketRate()
+							if configuredRate > 0 && packetSize > 0 && configuredRate <= math.MaxUint64/packetSize {
+								result.ExpectedRateBytesPerSecond = configuredRate * packetSize
+							}
+						}
+
+						// Calculate actual rate with overflow protection
+						actualBytes := snapshot.PacketsReceived * packetSize
+						if actualBytes > 0 {
+							result.QualificationRateBytesPerSecond = actualBytes / uint64(durationSeconds)
+						}
 					}
-					result.QualificationRateBytesPerSecond = (qualState.PacketsReceived * packetSize) / uint64(duration.Seconds())
 				}
 			}
 
@@ -518,38 +605,15 @@ func (lq *linkQualification) Delete(ctx context.Context, req *plqpb.DeleteReques
 				id, interfaceName, len(history))
 		}
 
-		// Track operation for potential cleanup
-		operationsToCleanup[qualState.OperationID] = true
-
 		// Remove from individual qualification mapping
 		delete(lq.qualifications, id)
-		delete(lq.interfaceToTest, qualState.InterfaceName)
 
 		response.Results[id] = &rpc.Status{
 			Code:    int32(codes.OK),
 			Message: "qualification deleted successfully",
 		}
 
-		log.Infof("Deleted qualification %s (op_id=%s) for interface %s", id, qualState.OperationID, qualState.InterfaceName)
-	}
-
-	// Clean up empty operations
-	for operationID := range operationsToCleanup {
-		if qualStates, exists := lq.operationTests[operationID]; exists {
-			// Check if all qualifications in this operation are deleted
-			allDeleted := true
-			for _, qual := range qualStates {
-				if _, stillExists := lq.qualifications[qual.ID]; stillExists {
-					allDeleted = false
-					break
-				}
-			}
-
-			if allDeleted {
-				delete(lq.operationTests, operationID)
-				log.Infof("Cleaned up operation %s - all qualifications deleted", operationID)
-			}
-		}
+		log.Infof("Deleted qualification %s for interface %s", id, snapshot.InterfaceName)
 	}
 
 	return response, nil
@@ -564,9 +628,6 @@ func (lq *linkQualification) List(ctx context.Context, req *plqpb.ListRequest) (
 
 	var results []*plqpb.ListResult
 
-	// Group by operation for better overview
-	operationSummary := make(map[string]int)
-
 	for _, qualState := range lq.qualifications {
 		result := &plqpb.ListResult{
 			Id:            qualState.ID,
@@ -574,76 +635,33 @@ func (lq *linkQualification) List(ctx context.Context, req *plqpb.ListRequest) (
 			InterfaceName: qualState.InterfaceName,
 		}
 		results = append(results, result)
-
-		// Track operation summary
-		operationSummary[qualState.OperationID]++
 	}
 
-	// Log operation summary for debugging
-	log.Infof("List results: %d total qualifications across %d operations",
-		len(results), len(operationSummary))
-	for opID, count := range operationSummary {
-		log.Infof("  Operation %s: %d qualifications", opID, count)
-	}
+	log.Infof("List results: %d total qualifications", len(results))
 
 	return &plqpb.ListResponse{
 		Results: results,
 	}, nil
 }
 
-// buildCapabilities creates the static capabilities response
-func buildCapabilities() *plqpb.CapabilitiesResponse {
-	return &plqpb.CapabilitiesResponse{
-		Time:      timestamppb.Now(),
-		NtpSynced: true,
-		Generator: &plqpb.GeneratorCapabilities{
-			PacketGenerator: &plqpb.PacketGeneratorCapabilities{
-				MaxBps:              400000000000, // 400 Gbps
-				MaxPps:              500000000,    // 500M PPS
-				MinMtu:              64,
-				MaxMtu:              9000,
-				MinSetupDuration:    durationpb.New(1 * time.Second),
-				MinTeardownDuration: durationpb.New(1 * time.Second),
-				MinSampleInterval:   durationpb.New(1 * time.Second),
-			},
-			PacketInjector: &plqpb.PacketInjectorCapabilities{
-				MinMtu:              64,
-				MaxMtu:              9000,
-				MinInjectedPackets:  1,
-				MaxInjectedPackets:  1000000000, // 1B packets
-				MinSetupDuration:    durationpb.New(1 * time.Second),
-				MinTeardownDuration: durationpb.New(1 * time.Second),
-				MinSampleInterval:   durationpb.New(1 * time.Second),
-			},
-		},
-		Reflector: &plqpb.ReflectorCapabilities{
-			AsicLoopback: &plqpb.AsicLoopbackCapabilities{
-				MinSetupDuration:    durationpb.New(1 * time.Second),
-				MinTeardownDuration: durationpb.New(1 * time.Second),
-				Fields:              []plqpb.HeaderMatchField{plqpb.HeaderMatchField_HEADER_MATCH_FIELD_L2},
-			},
-			PmdLoopback: &plqpb.PmdLoopbackCapabilities{
-				MinSetupDuration:    durationpb.New(1 * time.Second),
-				MinTeardownDuration: durationpb.New(1 * time.Second),
-			},
-		},
-		MaxHistoricalResultsPerInterface: 10,
-	}
-}
-
 // validateQualificationConfig validates a single qualification configuration
 func (lq *linkQualification) validateQualificationConfig(config *plqpb.QualificationConfiguration) error {
 	id := config.GetId()
-	interfaceName := config.GetInterfaceName()
 
 	// Check for duplicate ID across all operations
 	if _, exists := lq.qualifications[id]; exists {
 		return status.Errorf(codes.AlreadyExists, "qualification id already exists")
 	}
 
-	// Check if interface is already in use by another operation
-	if existingOpID, inUse := lq.interfaceToTest[interfaceName]; inUse {
-		return status.Errorf(codes.AlreadyExists, "interface %s already in use by operation %s", interfaceName, existingOpID)
+	// Validate interface exists in the system
+	interfaceName := config.GetInterfaceName()
+	interfacePath := ocpath.Root().Interface(interfaceName)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := ygnmi.Get(ctx, lq.c, interfacePath.State())
+	if err != nil {
+		return status.Errorf(codes.NotFound, "interface %s not found", interfaceName)
 	}
 
 	// Validate endpoint type is specified
@@ -670,15 +688,8 @@ func (lq *linkQualification) validateQualificationConfig(config *plqpb.Qualifica
 			return status.Errorf(codes.InvalidArgument, "test duration must be positive")
 		}
 	case *plqpb.QualificationConfiguration_Ntp:
-		ntpTiming := t.Ntp
-		if ntpTiming.GetStartTime() == nil || ntpTiming.GetEndTime() == nil {
-			return status.Errorf(codes.InvalidArgument, "NTP start and end times are required")
-		}
-		startTime := ntpTiming.GetStartTime().AsTime()
-		endTime := ntpTiming.GetEndTime().AsTime()
-		if !endTime.After(startTime) {
-			return status.Errorf(codes.InvalidArgument, "NTP end time must be after start time")
-		}
+		// NTP timing is not implemented in simulation
+		return status.Errorf(codes.Unimplemented, "NTP timing is not implemented in simulation")
 	default:
 		return status.Errorf(codes.InvalidArgument, "unknown timing configuration type")
 	}
@@ -690,20 +701,9 @@ func (lq *linkQualification) validateQualificationConfig(config *plqpb.Qualifica
 		if pg.GetPacketRate() == 0 {
 			return status.Errorf(codes.InvalidArgument, "packet rate must be greater than 0")
 		}
-		// Apply proto-specified default for packet size
-		packetSize := pg.GetPacketSize()
-		if packetSize == 0 {
-			packetSize = 1500
-		}
 	case *plqpb.QualificationConfiguration_PacketInjector:
-		pi := et.PacketInjector
-		if pi.GetPacketCount() == 0 {
-			return status.Errorf(codes.InvalidArgument, "packet count must be greater than 0")
-		}
-		// Validate loopback mode for packet injector (ensure one of the oneof options is set)
-		if pi.GetPmdLoopback() == nil && pi.GetAsicLoopback() == nil {
-			return status.Errorf(codes.InvalidArgument, "packet injector loopback mode must be specified")
-		}
+		// PacketInjector is not implemented in simulation
+		return status.Errorf(codes.Unimplemented, "PacketInjector endpoint type is not implemented in simulation")
 	case *plqpb.QualificationConfiguration_AsicLoopback:
 		// ASIC loopback is valid with any non-nil configuration
 	case *plqpb.QualificationConfiguration_PmdLoopback:
@@ -716,215 +716,83 @@ func (lq *linkQualification) validateQualificationConfig(config *plqpb.Qualifica
 }
 
 // createQualificationState creates a qualification state from config
-func (lq *linkQualification) createQualificationState(config *plqpb.QualificationConfiguration, operationID string) *QualificationState {
-	// Determine endpoint type and impairments
-	isGenerator := config.GetPacketGenerator() != nil || config.GetPacketInjector() != nil
+func (lq *linkQualification) createQualificationState(config *plqpb.QualificationConfiguration) *QualificationState {
+	// Determine endpoint type
+	isGenerator := config.GetPacketGenerator() != nil
 	isReflector := config.GetAsicLoopback() != nil || config.GetPmdLoopback() != nil
-
-	// Configure network impairments based on interface type and test parameters
-	impairments := lq.calculateNetworkImpairments(config)
 
 	state := &QualificationState{
 		ID:            config.GetId(),
-		OperationID:   operationID,
 		InterfaceName: config.GetInterfaceName(),
 		State:         plqpb.QualificationState_QUALIFICATION_STATE_IDLE,
 		Config:        config,
 		StartTime:     time.Now(),
 		IsGenerator:   isGenerator,
 		IsReflector:   isReflector,
-		impairments:   impairments,
 		cancelCh:      make(chan struct{}, 1),
 		done:          false,
 	}
 
-	log.Infof("Created qualification state: id=%s, op_id=%s, interface=%s, generator=%v, reflector=%v",
-		state.ID, state.OperationID, state.InterfaceName, state.IsGenerator, state.IsReflector)
+	log.Infof("Created qualification state: id=%s, interface=%s, generator=%v, reflector=%v",
+		state.ID, state.InterfaceName, state.IsGenerator, state.IsReflector)
 
 	return state
 }
 
-// calculateNetworkImpairments determines network conditions based on configuration
-func (lq *linkQualification) calculateNetworkImpairments(config *plqpb.QualificationConfiguration) *fakedevice.NetworkImpairments {
-	// Phase 1: Default to near-perfect conditions for OpenConfig compliance
-	// Phase 2: Support configurable impairments through lemming config
-
-	impairments := &fakedevice.NetworkImpairments{
-		PacketLossRate: 0.0,                   // Perfect link with zero loss
-		CorruptionRate: 0.0,                   // Perfect link with zero corruption
-		JitterRange:    10 * time.Microsecond, // Minimal ±10μs jitter
-		LatencyBase:    1 * time.Microsecond,  // 1μs base latency
-	}
-
-	// Check if the lemming config has network simulation parameters
-	if lq.config != nil && lq.config.GetNetworkSim() != nil {
-		netSim := lq.config.GetNetworkSim()
-
-		// Apply configured packet loss rate if specified
-		if netSim.PacketLossRate > 0 {
-			impairments.PacketLossRate = float64(netSim.PacketLossRate)
-			log.Infof("Applying configured packet loss rate: %.4f%%", impairments.PacketLossRate*100)
-		}
-
-		// Apply configured latency parameters
-		if netSim.BaseLatencyMs > 0 {
-			impairments.LatencyBase = time.Duration(netSim.BaseLatencyMs) * time.Millisecond
-		}
-		if netSim.LatencyJitterMs > 0 {
-			impairments.JitterRange = time.Duration(netSim.LatencyJitterMs) * time.Millisecond
-		}
-
-		// Future: Support for corruption rate
-		// This would require extending the NetworkSim config
-	}
-
-	// For specific testing scenarios, allow interface-specific overrides
-	// This could be extended in Phase 2 to support per-interface configuration
-	interfaceName := config.GetInterfaceName()
-	if strings.Contains(interfaceName, "lossy") {
-		// Special test interface with higher loss
-		impairments.PacketLossRate = 0.01 // 1% loss
-		log.Infof("Applied test configuration for lossy interface %s", interfaceName)
-	} else if strings.Contains(interfaceName, "latency") {
-		// Special test interface with higher latency
-		impairments.LatencyBase = 10 * time.Millisecond
-		impairments.JitterRange = 2 * time.Millisecond
-		log.Infof("Applied test configuration for high-latency interface %s", interfaceName)
-	}
-
-	log.Infof("Calculated impairments for %s: loss=%.4f%%, corruption=%.7f%%, jitter=±%v, latency=%v",
-		config.GetInterfaceName(),
-		impairments.PacketLossRate*100,
-		impairments.CorruptionRate*100,
-		impairments.JitterRange,
-		impairments.LatencyBase)
-
-	return impairments
-}
-
-// executeOperationGroup coordinates multi-port qualification execution by calling fakedevice simulations
-func (lq *linkQualification) executeOperationGroup(ctx context.Context, operationID string, qualifications []*QualificationState) {
-	log.Infof("Starting operation group execution: %s with %d qualifications", operationID, len(qualifications))
-
-	// Start all qualifications in the operation group
-	for _, qual := range qualifications {
-		go lq.executeQualification(ctx, qual)
-	}
-
-	log.Infof("Started all qualifications in operation %s", operationID)
-}
-
-// markQualificationError marks a qualification as failed
-func (lq *linkQualification) markQualificationError(qual *QualificationState, errorMsg string) {
-	lq.mu.Lock()
-	defer lq.mu.Unlock()
-
-	qual.State = plqpb.QualificationState_QUALIFICATION_STATE_ERROR
-	qual.done = true
-	qual.EndTime = time.Now()
-
-	log.Errorf("Qualification %s failed: %s", qual.ID, errorMsg)
-}
-
 // executeQualification runs a single qualification by calling fakedevice simulation
 func (lq *linkQualification) executeQualification(ctx context.Context, qual *QualificationState) {
-	log.Infof("Starting qualification execution: %s for interface %s (generator=%v, reflector=%v)",
-		qual.ID, qual.InterfaceName, qual.IsGenerator, qual.IsReflector)
-
-	// Create update channel for simulation
-	updateChan := make(chan *fakedevice.LinkQualificationResult, 10)
-
-	// Create a context that can be cancelled
+	// Create cancellable context for the simulation
 	qualCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Use simulation with impairments support
+	// Handle cancellation immediately
 	go func() {
-		defer close(updateChan)
-		if err := fakedevice.RunPacketLinkQualification(qualCtx, lq.c, qual.Config, updateChan, lq.config, qual.impairments); err != nil {
-			log.Errorf("Link qualification simulation failed for %s: %v", qual.ID, err)
-			lq.markQualificationError(qual, fmt.Sprintf("simulation failed: %v", err))
-		}
-	}()
-
-	// Process simulation updates
-	for {
 		select {
 		case <-qual.cancelCh:
 			log.Infof("Qualification %s cancelled", qual.ID)
-			cancel() // Cancel the simulation context
-			return
-		case update, ok := <-updateChan:
-			if !ok {
-				// Channel closed, simulation finished
-				log.Infof("Qualification %s simulation completed", qual.ID)
+			cancel()
+		case <-qualCtx.Done():
+			// Context already cancelled
+		}
+	}()
 
-				// Handle generator-reflector coordination
-				if qual.pairedQualID != "" && qual.IsGenerator {
-					lq.coordinateWithPairedQualification(qual)
-				}
-				return
+	// Update callback function to replace channel communication
+	updateCallback := func(result *fakedevice.LinkQualificationResult) {
+		// Update internal state atomically
+		qual.mu.Lock()
+		if !qual.done {
+			qual.State = result.State
+			qual.PacketsSent = result.PacketsSent
+			qual.PacketsReceived = result.PacketsReceived
+			qual.PacketsDropped = result.PacketsDropped
+			qual.PacketsError = result.PacketsError
+			qual.StartTime = result.StartTime
+			if !result.EndTime.IsZero() {
+				qual.EndTime = result.EndTime
 			}
 
-			// Update internal state atomically
-			qual.mu.Lock()
-			if !qual.done {
-				qual.State = update.State
-				qual.PacketsSent = update.PacketsSent
-				qual.PacketsReceived = update.PacketsReceived
-				qual.PacketsDropped = update.PacketsDropped
-				qual.PacketsError = update.PacketsError
-				qual.StartTime = update.StartTime
-				if !update.EndTime.IsZero() {
-					qual.EndTime = update.EndTime
-				}
-
-				// Mark as done if completed or error
-				if update.State == plqpb.QualificationState_QUALIFICATION_STATE_COMPLETED ||
-					update.State == plqpb.QualificationState_QUALIFICATION_STATE_ERROR {
-					qual.done = true
-				}
-			}
-			qual.mu.Unlock()
-
-			// Log state transitions
-			if update.State != plqpb.QualificationState_QUALIFICATION_STATE_UNSPECIFIED {
-				log.Infof("Qualification %s transitioned to state %v", qual.ID, update.State)
+			// Mark as done if completed or error
+			if result.State == plqpb.QualificationState_QUALIFICATION_STATE_COMPLETED ||
+				result.State == plqpb.QualificationState_QUALIFICATION_STATE_ERROR {
+				qual.done = true
 			}
 		}
-	}
-}
-
-// coordinateWithPairedQualification updates paired reflector statistics based on generator results
-func (lq *linkQualification) coordinateWithPairedQualification(generatorQual *QualificationState) {
-	if generatorQual.pairedQualID == "" {
-		return
+		qual.mu.Unlock()
+		log.Infof("Qualification %s transitioned to state %v", qual.ID, result.State)
 	}
 
-	lq.mu.RLock()
-	reflectorQual, exists := lq.qualifications[generatorQual.pairedQualID]
-	lq.mu.RUnlock()
-
-	if !exists {
-		log.Warningf("Paired qualification %s not found for generator %s", generatorQual.pairedQualID, generatorQual.ID)
-		return
-	}
-
-	// Update reflector statistics based on generator
-	// In a real scenario, reflector receives what generator sends (minus losses)
-	reflectorQual.mu.Lock()
-	defer reflectorQual.mu.Unlock()
-
-	if reflectorQual.IsReflector && !reflectorQual.done {
-		// Reflector receives what generator sent (minus network losses)
-		reflectorQual.PacketsReceived = generatorQual.PacketsSent - generatorQual.PacketsDropped
-		// Reflector sends back what it received
-		reflectorQual.PacketsSent = reflectorQual.PacketsReceived
-		// Reflector has same error count as generator
-		reflectorQual.PacketsError = generatorQual.PacketsError
-
-		log.Infof("Coordinated reflector %s stats with generator %s: sent=%d, received=%d",
-			reflectorQual.ID, generatorQual.ID, reflectorQual.PacketsSent, reflectorQual.PacketsReceived)
+	// Run the simulation directly with callback
+	log.Infof("Starting RunPacketLinkQualification for %s", qual.ID)
+	if err := fakedevice.RunPacketLinkQualification(qualCtx, lq.c, qual.Config, updateCallback, lq.config); err != nil {
+		log.Errorf("Link qualification simulation failed for %s: %v", qual.ID, err)
+		// Mark qualification as failed
+		qual.mu.Lock()
+		qual.State = plqpb.QualificationState_QUALIFICATION_STATE_ERROR
+		qual.done = true
+		qual.EndTime = time.Now()
+		qual.mu.Unlock()
+	} else {
+		log.Infof("RunPacketLinkQualification completed successfully for %s", qual.ID)
 	}
 }
 
