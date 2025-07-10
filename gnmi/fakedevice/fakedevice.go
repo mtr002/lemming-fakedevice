@@ -17,6 +17,8 @@ package fakedevice
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
+	"sync"
 	"time"
 
 	log "github.com/golang/glog"
@@ -39,6 +41,22 @@ const (
 	StaticRoutingProtocol  = "DEFAULT"
 	BGPRoutingProtocol     = "BGP"
 )
+
+var (
+	// Thread-safe random source for ping simulation
+	randMu  sync.Mutex
+	randSrc = rand.NewPCG(uint64(time.Now().UnixNano()), uint64(time.Now().UnixNano()>>32))
+	randGen = rand.New(randSrc) //nolint:gosec // Using math/rand for network simulation
+)
+
+// PingPacketResult represents the result of a single ping packet
+type PingPacketResult struct {
+	Sequence int32
+	RTT      time.Duration
+	Bytes    uint32
+	TTL      int32
+	Success  bool
+}
 
 // Reboot updates the system boot time to the provided Unix time.
 func Reboot(ctx context.Context, c *ygnmi.Client, rebootTime int64) error {
@@ -183,6 +201,110 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 			log.Infof("Successfully restarted process %s with new PID: %d", processName, newPID)
 		}()
 	}
+	return nil
+}
+
+// PingSimulation simulates ping operation with configurable network conditions
+func PingSimulation(ctx context.Context, destination string, count int32, interval time.Duration, wait time.Duration, size uint32, responseChan chan<- *PingPacketResult, cfg *configpb.LemmingConfig) error {
+	log.Infof("Starting ping simulation to %s with count=%d, interval=%v, wait=%v",
+		destination, count, interval, wait)
+
+	baseLatency := time.Duration(cfg.GetNetworkSim().GetBaseLatencyMs()) * time.Millisecond
+	latencyJitter := time.Duration(cfg.GetNetworkSim().GetLatencyJitterMs()) * time.Millisecond
+	packetLossRate := cfg.GetNetworkSim().GetPacketLossRate()
+	ttl := cfg.GetNetworkSim().GetDefaultTtl()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	packetCount := int32(0)
+	maxPackets := count
+	if maxPackets == -1 {
+		maxPackets = 1<<31 - 1
+	}
+
+	for packetCount < maxPackets {
+		select {
+		case <-ctx.Done():
+			log.Infof("Ping to %s cancelled", destination)
+			return ctx.Err()
+		case <-ticker.C:
+			packetCount++
+
+			// Simulate network conditions for this packet
+			networkLatency := simulateLatency(baseLatency, latencyJitter)
+			packetLost := packetLossRate > 0 && shouldDropPacket(packetLossRate)
+
+			var result *PingPacketResult
+
+			switch {
+			case packetLost:
+				// Packet lost - wait for timeout
+				waitTimer := time.NewTimer(wait)
+				select {
+				case <-waitTimer.C:
+				case <-ctx.Done():
+					waitTimer.Stop()
+					return ctx.Err()
+				}
+				result = &PingPacketResult{
+					Sequence: packetCount,
+					RTT:      0,
+					Bytes:    0,
+					TTL:      0,
+					Success:  false,
+				}
+				log.Infof("Ping to %s: seq=%d TIMEOUT (packet lost)", destination, packetCount)
+
+			case networkLatency > wait:
+				// Response would arrive after wait timeout
+				waitTimer := time.NewTimer(wait)
+				select {
+				case <-waitTimer.C:
+				case <-ctx.Done():
+					waitTimer.Stop()
+					return ctx.Err()
+				}
+				result = &PingPacketResult{
+					Sequence: packetCount,
+					RTT:      0,
+					Bytes:    0,
+					TTL:      0,
+					Success:  false,
+				}
+				log.Infof("Ping to %s: seq=%d TIMEOUT (latency %v > wait %v)",
+					destination, packetCount, networkLatency, wait)
+
+			default:
+				// Successful response within wait time
+				latencyTimer := time.NewTimer(networkLatency)
+				select {
+				case <-latencyTimer.C:
+				case <-ctx.Done():
+					latencyTimer.Stop()
+					return ctx.Err()
+				}
+				result = &PingPacketResult{
+					Sequence: packetCount,
+					RTT:      networkLatency,
+					Bytes:    size,
+					TTL:      ttl,
+					Success:  true,
+				}
+				log.Infof("Ping to %s: seq=%d time=%v bytes=%d ttl=%d",
+					destination, packetCount, networkLatency, size, ttl)
+			}
+
+			// Send result with non-blocking send
+			select {
+			case responseChan <- result:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	log.Infof("Ping simulation to %s completed after %d packets", destination, packetCount)
 	return nil
 }
 
@@ -449,4 +571,45 @@ func generateNewPID(ctx context.Context, c *ygnmi.Client, excludePID uint32) (ui
 		}
 	}
 	return 0, fmt.Errorf("no PID available in range 1-65535")
+}
+
+// getRandomInt64 returns a random int64 in the range [min, max)
+func getRandomInt64(min, max int64) int64 {
+	randMu.Lock()
+	defer randMu.Unlock()
+	if min >= max {
+		return min
+	}
+	return randGen.Int64N(max-min) + min
+}
+
+// shouldDropPacket determines if a packet should be dropped based on loss rate
+func shouldDropPacket(lossRate float32) bool {
+	if lossRate <= 0 {
+		return false
+	}
+	if lossRate >= 1.0 {
+		return true
+	}
+	lossPercentage := int64(lossRate * 100)
+	randomPercent := getRandomInt64(0, 100)
+	return randomPercent < lossPercentage
+}
+
+// simulateLatency generates realistic network latency with jitter
+func simulateLatency(baseLatency, jitter time.Duration) time.Duration {
+	if jitter == 0 {
+		return baseLatency
+	}
+	// Generate random jitter between -jitter and +jitter
+	jitterNs := jitter.Nanoseconds()
+	randomJitter := getRandomInt64(-jitterNs, jitterNs+1)
+	finalLatency := baseLatency + time.Duration(randomJitter)
+
+	// Ensure latency is never negative
+	if finalLatency <= 0 {
+		finalLatency = time.Millisecond
+	}
+
+	return finalLatency
 }
