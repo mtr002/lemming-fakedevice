@@ -902,6 +902,33 @@ func (lq *linkQualification) Delete(ctx context.Context, req *plqpb.DeleteReques
 	return response, nil
 }
 
+// List qualifications currently on the target
+func (lq *linkQualification) List(ctx context.Context, req *plqpb.ListRequest) (*plqpb.ListResponse, error) {
+	log.Infof("Received LinkQualification List request")
+
+	lq.mu.RLock()
+	defer lq.mu.RUnlock()
+
+	var results []*plqpb.ListResult
+
+	for _, qualState := range lq.qualifications {
+		qualState.mu.Lock()
+		result := &plqpb.ListResult{
+			Id:            qualState.ID,
+			State:         qualState.State,
+			InterfaceName: qualState.InterfaceName,
+		}
+		qualState.mu.Unlock()
+		results = append(results, result)
+	}
+
+	log.Infof("List results: %d total qualifications", len(results))
+
+	return &plqpb.ListResponse{
+		Results: results,
+	}, nil
+}
+
 // validateQualificationConfig validates a single qualification configuration
 func (lq *linkQualification) validateQualificationConfig(config *plqpb.QualificationConfiguration) error {
 	id := config.GetId()
