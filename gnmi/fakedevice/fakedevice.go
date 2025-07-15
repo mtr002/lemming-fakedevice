@@ -655,7 +655,10 @@ func extractQualificationTiming(config *plqpb.QualificationConfiguration, cfg *c
 	return timing
 }
 
-// executeQualificationStateMachine runs the complete state machine for link qualification
+// executeQualificationStateMachine runs a complete link qualification test through multiple phases:
+// pre-sync delay (optional), SETUP (initialize test), RUNNING (execute packet generation and measurement),
+// post-sync delay (optional), and TEARDOWN (cleanup resources).
+// It manages state transitions, context cancellation, and result updates throughout the qualification process.
 func executeQualificationStateMachine(
 	ctx context.Context,
 	c *ygnmi.Client,
@@ -779,7 +782,8 @@ func executeRunningPhase(
 
 	// Start packet simulation
 	startTime := time.Now()
-	updateTicker := time.NewTicker(1 * time.Second)
+	sampleInterval := time.Duration(cfg.GetLinkQualification().GetMinSampleIntervalMs()) * time.Millisecond
+	updateTicker := time.NewTicker(sampleInterval)
 	defer updateTicker.Stop()
 	testEndTime := startTime.Add(timing.TestDuration)
 

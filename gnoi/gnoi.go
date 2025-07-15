@@ -933,7 +933,8 @@ func (lq *linkQualification) List(ctx context.Context, req *plqpb.ListRequest) (
 func (lq *linkQualification) validateQualificationConfig(config *plqpb.QualificationConfiguration) error {
 	id := config.GetId()
 
-	// Check for duplicate ID across all operations
+	// Check for duplicate ID across all link qualification operations,
+	// in order to prevent two qualification tests from being created at the same time.
 	_, exists := lq.qualifications[id]
 	if exists {
 		return status.Errorf(codes.AlreadyExists, "qualification id already exists")
