@@ -17,6 +17,7 @@ package gnoi
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/golang/glog"
@@ -24,6 +25,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/openconfig/lemming/gnmi/fakedevice"
 	"github.com/openconfig/lemming/gnmi/oc"
@@ -41,14 +44,10 @@ import (
 	mpb "github.com/openconfig/gnoi/mpls"
 	ospb "github.com/openconfig/gnoi/os"
 	otpb "github.com/openconfig/gnoi/otdr"
+	plqpb "github.com/openconfig/gnoi/packet_link_qualification"
 	spb "github.com/openconfig/gnoi/system"
 	pb "github.com/openconfig/gnoi/types"
 	wrpb "github.com/openconfig/gnoi/wavelength_router"
-)
-
-const (
-	// Kill process default
-	defaultRestart = true
 )
 
 type bgp struct {
@@ -456,10 +455,12 @@ func (s *system) KillProcess(ctx context.Context, r *spb.KillProcessRequest) (*s
 		return nil, err
 	}
 
-	// HUP is for reload, restart should be false by default
-	restart := defaultRestart
+	var restart bool
 	if signal == spb.KillProcessRequest_SIGNAL_HUP {
+		// HUP is for reload, restart should be false
 		restart = false
+	} else {
+		restart = s.config.GetProcesses().GetDefaultRestartOnKill()
 	}
 
 	// Protect against concurrent process operations
@@ -574,24 +575,111 @@ func (s *system) getSupervisorRole(ctx context.Context) (activeSupervisor, stand
 	}
 }
 
+type linkQualification struct {
+	plqpb.UnimplementedLinkQualificationServer
+
+	c      *ygnmi.Client
+	config *configpb.LemmingConfig
+
+	mu sync.RWMutex
+	// Qualification state tracking
+	// qual_id -> state
+	qualifications map[string]*QualificationState
+	// Historical results tracking per interface
+	// interface -> historical results
+	historicalResults map[string][]*plqpb.QualificationResult
+	maxHistorical     uint64
+}
+
+// QualificationState represents the state of a single qualification
+type QualificationState struct {
+	ID            string
+	InterfaceName string
+	State         plqpb.QualificationState
+	StartTime     time.Time
+	EndTime       time.Time
+
+	// Packet statistics - use atomic operations for thread safety
+	packetsSent     atomic.Uint64
+	packetsReceived atomic.Uint64
+	packetsDropped  atomic.Uint64
+	packetsError    atomic.Uint64
+
+	// Configuration
+	IsGenerator bool
+	IsReflector bool
+	Config      *plqpb.QualificationConfiguration
+
+	// Control channels for cancellation
+	cancelCh chan struct{}
+	done     bool
+	// Protect individual state updates
+	mu sync.Mutex
+}
+
+func newLinkQualification(c *ygnmi.Client, config *configpb.LemmingConfig) *linkQualification {
+	return &linkQualification{
+		c:                 c,
+		config:            config,
+		qualifications:    make(map[string]*QualificationState),
+		historicalResults: make(map[string][]*plqpb.QualificationResult),
+		maxHistorical:     uint64(config.GetLinkQualification().GetMaxHistoricalResults()),
+	}
+}
+
+// Capabilities returns the capabilities of the LinkQualification service
+func (lq *linkQualification) Capabilities(ctx context.Context, req *plqpb.CapabilitiesRequest) (*plqpb.CapabilitiesResponse, error) {
+	log.Infof("Received LinkQualification Capabilities request")
+
+	return &plqpb.CapabilitiesResponse{
+		Time:      timestamppb.Now(),
+		NtpSynced: true,
+		Generator: &plqpb.GeneratorCapabilities{
+			PacketGenerator: &plqpb.PacketGeneratorCapabilities{
+				MaxBps:              lq.config.GetLinkQualification().GetMaxBps(),
+				MaxPps:              lq.config.GetLinkQualification().GetMaxPps(),
+				MinMtu:              lq.config.GetLinkQualification().GetMinMtu(),
+				MaxMtu:              lq.config.GetLinkQualification().GetMaxMtu(),
+				MinSetupDuration:    durationpb.New(time.Duration(lq.config.GetLinkQualification().GetMinSetupDurationMs()) * time.Millisecond),
+				MinTeardownDuration: durationpb.New(time.Duration(lq.config.GetLinkQualification().GetMinTeardownDurationMs()) * time.Millisecond),
+				MinSampleInterval:   durationpb.New(time.Duration(lq.config.GetLinkQualification().GetMinSampleIntervalMs()) * time.Millisecond),
+			},
+			// PacketInjector intentionally omitted - unimplemented in simulation
+		},
+		Reflector: &plqpb.ReflectorCapabilities{
+			AsicLoopback: &plqpb.AsicLoopbackCapabilities{
+				MinSetupDuration:    durationpb.New(time.Duration(lq.config.GetLinkQualification().GetMinSetupDurationMs()) * time.Millisecond),
+				MinTeardownDuration: durationpb.New(time.Duration(lq.config.GetLinkQualification().GetMinTeardownDurationMs()) * time.Millisecond),
+				Fields:              []plqpb.HeaderMatchField{plqpb.HeaderMatchField_HEADER_MATCH_FIELD_L2},
+			},
+			PmdLoopback: &plqpb.PmdLoopbackCapabilities{
+				MinSetupDuration:    durationpb.New(time.Duration(lq.config.GetLinkQualification().GetMinSetupDurationMs()) * time.Millisecond),
+				MinTeardownDuration: durationpb.New(time.Duration(lq.config.GetLinkQualification().GetMinTeardownDurationMs()) * time.Millisecond),
+			},
+		},
+		MaxHistoricalResultsPerInterface: lq.maxHistorical,
+	}, nil
+}
+
 type wavelengthRouter struct {
 	wrpb.UnimplementedWavelengthRouterServer
 }
 
 type Server struct {
-	s                      *grpc.Server
-	bgpServer              *bgp
-	certServer             *cert
-	diagServer             *diag
-	fileServer             *file
-	resetServer            *factoryReset
-	healthzServer          *healthz
-	layer2Server           *layer2
-	mplsServer             *mpls
-	osServer               *os
-	otdrServer             *otdr
-	systemServer           *system
-	wavelengthRouterServer *wavelengthRouter
+	s                       *grpc.Server
+	bgpServer               *bgp
+	certServer              *cert
+	diagServer              *diag
+	fileServer              *file
+	resetServer             *factoryReset
+	healthzServer           *healthz
+	layer2Server            *layer2
+	linkQualificationServer *linkQualification
+	mplsServer              *mpls
+	osServer                *os
+	otdrServer              *otdr
+	systemServer            *system
+	wavelengthRouterServer  *wavelengthRouter
 }
 
 func New(s *grpc.Server, gClient gpb.GNMIClient, target string, config *configpb.LemmingConfig) (*Server, error) {
@@ -601,19 +689,20 @@ func New(s *grpc.Server, gClient gpb.GNMIClient, target string, config *configpb
 	}
 
 	srv := &Server{
-		s:                      s,
-		bgpServer:              &bgp{},
-		certServer:             &cert{},
-		diagServer:             &diag{},
-		fileServer:             &file{},
-		resetServer:            &factoryReset{},
-		healthzServer:          &healthz{},
-		layer2Server:           &layer2{},
-		mplsServer:             &mpls{},
-		osServer:               &os{},
-		otdrServer:             &otdr{},
-		systemServer:           newSystem(yclient, config),
-		wavelengthRouterServer: &wavelengthRouter{},
+		s:                       s,
+		bgpServer:               &bgp{},
+		certServer:              &cert{},
+		diagServer:              &diag{},
+		fileServer:              &file{},
+		resetServer:             &factoryReset{},
+		healthzServer:           &healthz{},
+		layer2Server:            &layer2{},
+		mplsServer:              &mpls{},
+		osServer:                &os{},
+		otdrServer:              &otdr{},
+		linkQualificationServer: newLinkQualification(yclient, config),
+		systemServer:            newSystem(yclient, config),
+		wavelengthRouterServer:  &wavelengthRouter{},
 	}
 	bpb.RegisterBGPServer(s, srv.bgpServer)
 	cmpb.RegisterCertificateManagementServer(s, srv.certServer)
@@ -625,6 +714,7 @@ func New(s *grpc.Server, gClient gpb.GNMIClient, target string, config *configpb
 	mpb.RegisterMPLSServer(s, srv.mplsServer)
 	ospb.RegisterOSServer(s, srv.osServer)
 	otpb.RegisterOTDRServer(s, srv.otdrServer)
+	plqpb.RegisterLinkQualificationServer(s, srv.linkQualificationServer)
 	spb.RegisterSystemServer(s, srv.systemServer)
 	wrpb.RegisterWavelengthRouterServer(s, srv.wavelengthRouterServer)
 	return srv, nil

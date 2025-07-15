@@ -140,10 +140,18 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 
 	log.Infof("Process %s (PID: %d) terminated successfully", processName, pid)
 
-	// Restart logic with 2-second delay if restart=true
+	// Restart logic with configurable delay if restart=true
 	if restart {
 		go func() {
-			time.Sleep(2 * time.Second)
+			// Use configured restart delay, fallback to default if not set
+			var restartDelayMs int64
+			if cfg.GetTiming() != nil {
+				restartDelayMs = cfg.GetTiming().GetProcessRestartDelayMs()
+			}
+			if restartDelayMs <= 0 {
+				restartDelayMs = 2000
+			}
+			time.Sleep(time.Duration(restartDelayMs) * time.Millisecond)
 
 			// PID generation for restarted processes
 			newPID, err := generateNewPID(ctx, c, pid)
@@ -155,7 +163,7 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 
 			// Create new process with same name but new PID
 			restartTime := time.Now().UnixNano()
-			restartCtx := gnmi.AddTimestampMetadata(ctx, restartTime)
+			restartCtx := gnmi.AddTimestampMetadata(context.Background(), restartTime)
 
 			var newProcess *oc.System_Process
 			procConfig := config.GetProcessByName(cfg, processName)
@@ -184,6 +192,31 @@ func KillProcess(ctx context.Context, c *ygnmi.Client, pid uint32, processName s
 		}()
 	}
 	return nil
+}
+
+// generateNewPID generates a new unique PID for restarted processes
+func generateNewPID(ctx context.Context, c *ygnmi.Client, excludePID uint32) (uint32, error) {
+	processes, err := ygnmi.GetAll(ctx, c, ocpath.Root().System().ProcessAny().State())
+	if err != nil {
+		return 0, fmt.Errorf("failed to get existing processes: %v", err)
+	}
+
+	// Build set of used PIDs
+	used := make(map[uint32]bool)
+	for _, p := range processes {
+		if p.Pid != nil {
+			used[uint32(*p.Pid)] = true
+		}
+	}
+	used[excludePID] = true
+
+	// Use a reasonable PID range
+	for pid := uint32(1); pid <= 65535; pid++ {
+		if !used[pid] {
+			return pid, nil
+		}
+	}
+	return 0, fmt.Errorf("no PID available in range 1-65535")
 }
 
 // NewBootTimeTask initializes boot-related paths.
@@ -430,27 +463,44 @@ func NewProcessMonitoringTask(cfg *configpb.LemmingConfig) *reconciler.BuiltReco
 	return rec
 }
 
-// generateNewPID generates a new unique PID for restarted processes
-func generateNewPID(ctx context.Context, c *ygnmi.Client, excludePID uint32) (uint32, error) {
-	processes, err := ygnmi.GetAll(ctx, c, ocpath.Root().System().ProcessAny().State())
-	if err != nil {
-		return 0, fmt.Errorf("failed to get existing processes: %v", err)
-	}
+// NewInterfaceInitializationTask initializes base network interfaces for link qualification simulation
+func NewInterfaceInitializationTask(cfg *configpb.LemmingConfig) *reconciler.BuiltReconciler {
+	rec := reconciler.NewBuilder("interface initialization").
+		WithStart(func(ctx context.Context, c *ygnmi.Client) error {
+			now := time.Now().UnixNano()
+			timestampedCtx := gnmi.AddTimestampMetadata(ctx, now)
+			batch := &ygnmi.SetBatch{}
 
-	// Build set of used PIDs
-	used := make(map[uint32]bool)
-	for _, p := range processes {
-		if p.Pid != nil {
-			used[uint32(*p.Pid)] = true
-		}
-	}
-	used[excludePID] = true
+			// Get interfaces from configuration
+			interfaceSpecs := cfg.GetInterfaces().GetInterface()
+			if len(interfaceSpecs) == 0 {
+				log.Warning("No interfaces found in configuration")
+				return nil
+			}
 
-	// Use a reasonable PID range
-	for pid := uint32(1); pid <= 65535; pid++ {
-		if !used[pid] {
-			return pid, nil
-		}
-	}
-	return 0, fmt.Errorf("no PID available in range 1-65535")
+			log.Infof("Initializing %d network interfaces from configuration", len(interfaceSpecs))
+
+			for _, intfConfig := range interfaceSpecs {
+				intf := &oc.Interface{
+					Name:        ygot.String(intfConfig.GetName()),
+					OperStatus:  oc.Interface_OperStatus_UP,
+					Enabled:     ygot.Bool(true),
+					Description: ygot.String(intfConfig.GetDescription()),
+					Ifindex:     ygot.Uint32(intfConfig.GetIfIndex()),
+				}
+
+				gnmiclient.BatchReplace(batch, ocpath.Root().Interface(intfConfig.GetName()).State(), intf)
+				log.Infof("Batching initialization for interface %s (ifindex: %d)", intfConfig.GetName(), intfConfig.GetIfIndex())
+			}
+
+			if _, err := batch.Set(timestampedCtx, c); err != nil {
+				log.Errorf("Error applying batched interface initializations: %v", err)
+				return err
+			}
+
+			log.Infof("Successfully initialized %d network interfaces", len(interfaceSpecs))
+			return nil
+		}).Build()
+
+	return rec
 }
