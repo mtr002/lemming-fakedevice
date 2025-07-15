@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -762,6 +763,145 @@ func (lq *linkQualification) Create(ctx context.Context, req *plqpb.CreateReques
 	return response, nil
 }
 
+// Get returns the status for the provided qualification ids
+func (lq *linkQualification) Get(ctx context.Context, req *plqpb.GetRequest) (*plqpb.GetResponse, error) {
+	log.Infof("Received LinkQualification Get request: %v", req.GetIds())
+
+	if len(req.GetIds()) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "no qualification ids specified")
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	response := &plqpb.GetResponse{
+		Results: make(map[string]*plqpb.QualificationResult),
+	}
+
+	lq.mu.RLock()
+	defer lq.mu.RUnlock()
+
+	for _, id := range req.GetIds() {
+		qualState, exists := lq.qualifications[id]
+		if !exists {
+			// Return NOT_FOUND result for missing qualifications
+			response.Results[id] = &plqpb.QualificationResult{
+				Id: id,
+				Status: &rpc.Status{
+					Code:    int32(codes.NotFound),
+					Message: fmt.Sprintf("qualification %s not found", id),
+				},
+			}
+			continue
+		}
+
+		// Get a thread-safe snapshot
+		snapshot := qualState.getSnapshot()
+
+		// Create a new result from the snapshot
+		result := lq.buildQualificationResult(snapshot, true)
+
+		// Set status field for ERROR states
+		if snapshot.State == plqpb.QualificationState_QUALIFICATION_STATE_ERROR {
+			result.Status = &rpc.Status{
+				Code:    int32(codes.Internal),
+				Message: "qualification encountered an error",
+			}
+		}
+
+		response.Results[id] = result
+	}
+
+	return response, nil
+}
+
+// Delete removes the qualification results for the provided ids
+func (lq *linkQualification) Delete(ctx context.Context, req *plqpb.DeleteRequest) (*plqpb.DeleteResponse, error) {
+	log.Infof("Received LinkQualification Delete request: %v", req.GetIds())
+
+	if len(req.GetIds()) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "no qualification ids specified")
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	response := &plqpb.DeleteResponse{
+		Results: make(map[string]*rpc.Status),
+	}
+
+	lq.mu.Lock()
+	defer lq.mu.Unlock()
+
+	for _, id := range req.GetIds() {
+		qualState, exists := lq.qualifications[id]
+		if !exists {
+			response.Results[id] = &rpc.Status{
+				Code:    int32(codes.NotFound),
+				Message: fmt.Sprintf("qualification %s not found", id),
+			}
+			continue
+		}
+
+		// Cancel the qualification if it is not completed.
+		qualState.mu.Lock()
+		var cancellationFailed bool
+		if !qualState.done {
+			select {
+			case qualState.cancelCh <- struct{}{}:
+				log.Infof("Sent cancellation signal for qualification %s", id)
+				// Update state to reflect cancellation.
+				qualState.done = true
+				qualState.State = plqpb.QualificationState_QUALIFICATION_STATE_ERROR
+				qualState.EndTime = time.Now()
+			default:
+				// Channel is full or closed - cancellation failed.
+				cancellationFailed = true
+				log.Warningf("Failed to send cancellation signal for qualification %s - channel full or closed", id)
+			}
+		}
+		// Create a snapshot of the final state after attempting cancellation.
+		snapshot := qualState.getSnapshotLocked()
+		qualState.mu.Unlock()
+
+		if cancellationFailed {
+			response.Results[id] = &rpc.Status{
+				Code:    int32(codes.FailedPrecondition),
+				Message: fmt.Sprintf("qualification %s cannot be stopped", id),
+			}
+			continue
+		}
+
+		// Store completed qualification in historical results if it completed successfully
+		if snapshot.State == plqpb.QualificationState_QUALIFICATION_STATE_COMPLETED {
+			interfaceName := snapshot.InterfaceName
+
+			// Create qualification result for historical storage
+			result := lq.buildQualificationResult(snapshot, false)
+
+			history := lq.historicalResults[interfaceName]
+			history = append(history, result)
+
+			// Keep only the most recent results up to maxHistorical
+			if uint64(len(history)) > lq.maxHistorical {
+				history = history[uint64(len(history))-lq.maxHistorical:]
+			}
+			lq.historicalResults[interfaceName] = history
+		}
+
+		delete(lq.qualifications, id)
+
+		response.Results[id] = &rpc.Status{
+			Code:    int32(codes.OK),
+			Message: "qualification deleted successfully",
+		}
+
+		log.Infof("Deleted qualification %s for interface %s", id, snapshot.InterfaceName)
+	}
+
+	return response, nil
+}
+
 // validateQualificationConfig validates a single qualification configuration
 func (lq *linkQualification) validateQualificationConfig(config *plqpb.QualificationConfiguration) error {
 	id := config.GetId()
@@ -910,6 +1050,122 @@ func (lq *linkQualification) executeQualification(ctx context.Context, qual *Qua
 	} else {
 		log.Infof("RunPacketLinkQualification completed successfully for %s", qual.ID)
 	}
+}
+
+// getSnapshot creates a thread-safe snapshot of the qualification state
+func (qs *QualificationState) getSnapshot() QualificationSnapshot {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+	return qs.getSnapshotLocked()
+}
+
+// getSnapshotLocked creates a snapshot of the qualification state.
+// It assumes the caller holds the lock on qs.mu.
+func (qs *QualificationState) getSnapshotLocked() QualificationSnapshot {
+	isComplete := qs.done
+	return QualificationSnapshot{
+		ID:              qs.ID,
+		InterfaceName:   qs.InterfaceName,
+		State:           qs.State,
+		StartTime:       qs.StartTime,
+		EndTime:         qs.EndTime,
+		PacketsSent:     qs.packetsSent.Load(),
+		PacketsReceived: qs.packetsReceived.Load(),
+		PacketsDropped:  qs.packetsDropped.Load(),
+		PacketsError:    qs.packetsError.Load(),
+		Config:          qs.Config,
+		IsComplete:      isComplete,
+	}
+}
+
+// QualificationSnapshot is a snapshot of qualification state
+type QualificationSnapshot struct {
+	ID              string
+	InterfaceName   string
+	State           plqpb.QualificationState
+	StartTime       time.Time
+	EndTime         time.Time
+	PacketsSent     uint64
+	PacketsReceived uint64
+	PacketsDropped  uint64
+	PacketsError    uint64
+	Config          *plqpb.QualificationConfiguration
+	IsComplete      bool
+}
+
+// buildQualificationResult creates a QualificationResult from a snapshot with rate calculations
+func (lq *linkQualification) buildQualificationResult(snapshot QualificationSnapshot, useCurrentTimeIfOngoing bool) *plqpb.QualificationResult {
+	result := &plqpb.QualificationResult{
+		Id:              snapshot.ID,
+		InterfaceName:   snapshot.InterfaceName,
+		State:           snapshot.State,
+		StartTime:       timestamppb.New(snapshot.StartTime),
+		PacketsSent:     snapshot.PacketsSent,
+		PacketsReceived: snapshot.PacketsReceived,
+		PacketsDropped:  snapshot.PacketsDropped,
+		PacketsError:    snapshot.PacketsError,
+	}
+
+	// Set end time based on completion status
+	if snapshot.IsComplete {
+		result.EndTime = timestamppb.New(snapshot.EndTime)
+	} else if useCurrentTimeIfOngoing {
+		result.EndTime = timestamppb.Now()
+	}
+
+	// Calculate rates if we have packet data (sent or received)
+	if snapshot.PacketsSent > 0 || snapshot.PacketsReceived > 0 {
+		var duration time.Duration
+		if snapshot.IsComplete {
+			duration = snapshot.EndTime.Sub(snapshot.StartTime)
+		} else if useCurrentTimeIfOngoing {
+			duration = time.Since(snapshot.StartTime)
+		}
+
+		if duration > 0 {
+			durationSeconds := duration.Seconds()
+			if durationSeconds > 0 {
+				// Get packet size from configuration
+				packetSize := uint64(8184)
+				if packetGen := snapshot.Config.GetPacketGenerator(); packetGen != nil && packetGen.GetPacketSize() > 0 {
+					packetSize = uint64(packetGen.GetPacketSize())
+				}
+				// Calculate expected rate.
+				if packetGen := snapshot.Config.GetPacketGenerator(); packetGen != nil {
+					configuredRate := packetGen.GetPacketRate()
+					if configuredRate > 0 && packetSize > 0 && configuredRate <= math.MaxUint64/packetSize {
+						result.ExpectedRateBytesPerSecond = configuredRate * packetSize
+					}
+				} else {
+					// For non-generator endpoints, calculate based on sent packets and duration
+					totalBytes := snapshot.PacketsSent * packetSize
+					if totalBytes > 0 {
+						result.ExpectedRateBytesPerSecond = uint64(float64(totalBytes) / durationSeconds)
+					}
+				}
+
+				// Calculate actual rate.
+				actualBytes := snapshot.PacketsReceived * packetSize
+				if actualBytes > 0 {
+					result.QualificationRateBytesPerSecond = uint64(float64(actualBytes) / durationSeconds)
+				}
+
+				// Log rate calculations for ongoing qualifications
+				if useCurrentTimeIfOngoing {
+					var lossPercent float64
+					if snapshot.PacketsSent > 0 {
+						lossPercent = float64(snapshot.PacketsDropped) / float64(snapshot.PacketsSent) * 100
+					}
+					log.Infof("Calculated rates for qualification %s: packet_size=%d, expected_rate=%d Bps, actual_rate=%d Bps, loss=%.4f%%",
+						snapshot.ID, packetSize,
+						result.ExpectedRateBytesPerSecond, result.QualificationRateBytesPerSecond,
+						lossPercent)
+				}
+			}
+		}
+	}
+
+	return result
 }
 
 type wavelengthRouter struct {
