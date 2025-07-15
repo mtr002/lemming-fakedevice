@@ -16,12 +16,15 @@ package gnoi
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	log "github.com/golang/glog"
 	"github.com/openconfig/ygnmi/ygnmi"
+	rpc "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -659,6 +662,254 @@ func (lq *linkQualification) Capabilities(ctx context.Context, req *plqpb.Capabi
 		},
 		MaxHistoricalResultsPerInterface: lq.maxHistorical,
 	}, nil
+}
+
+// Create starts link qualification on specified interfaces with multi-port support
+func (lq *linkQualification) Create(ctx context.Context, req *plqpb.CreateRequest) (*plqpb.CreateResponse, error) {
+	log.Infof("Received LinkQualification Create request with %d interfaces", len(req.GetInterfaces()))
+
+	if len(req.GetInterfaces()) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "no interfaces specified")
+	}
+
+	lq.mu.Lock()
+	defer lq.mu.Unlock()
+
+	// Batch validation - validate ALL interfaces before starting ANY
+	validationErrors := make(map[string]*rpc.Status)
+	qualificationStates := make([]*QualificationState, 0, len(req.GetInterfaces()))
+
+	// Track IDs and interfaces within this request to detect duplicates
+	requestIDs := make(map[string]bool)
+	requestInterfaces := make(map[string]bool)
+
+	for _, config := range req.GetInterfaces() {
+		if config.GetId() == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "qualification id is required")
+		}
+		if config.GetInterfaceName() == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "interface name is required")
+		}
+
+		id := config.GetId()
+		interfaceName := config.GetInterfaceName()
+
+		// Check for duplicates within this request first
+		if requestIDs[id] {
+			validationErrors[id] = &rpc.Status{
+				Code:    int32(codes.AlreadyExists),
+				Message: fmt.Sprintf("duplicate qualification id %s in request", id),
+			}
+			continue
+		}
+		if requestInterfaces[interfaceName] {
+			validationErrors[id] = &rpc.Status{
+				Code:    int32(codes.AlreadyExists),
+				Message: fmt.Sprintf("duplicate interface %s in request", interfaceName),
+			}
+			continue
+		}
+
+		requestIDs[id] = true
+		requestInterfaces[interfaceName] = true
+
+		// Validate against existing state and configuration
+		if err := lq.validateQualificationConfig(config); err != nil {
+			if grpcErr, ok := status.FromError(err); ok {
+				validationErrors[id] = &rpc.Status{
+					Code:    int32(grpcErr.Code()),
+					Message: grpcErr.Message(),
+				}
+			} else {
+				validationErrors[id] = &rpc.Status{
+					Code:    int32(codes.Internal),
+					Message: err.Error(),
+				}
+			}
+		} else {
+			// Create qualification state for valid configs
+			qualState := lq.createQualificationState(config)
+			qualificationStates = append(qualificationStates, qualState)
+		}
+	}
+
+	response := &plqpb.CreateResponse{
+		Status: make(map[string]*rpc.Status),
+	}
+	maps.Copy(response.Status, validationErrors)
+
+	// Proceed with creating qualifications if we have valid ones
+	if len(qualificationStates) > 0 {
+		for _, qualState := range qualificationStates {
+			lq.qualifications[qualState.ID] = qualState
+			if _, hasError := validationErrors[qualState.ID]; !hasError {
+				response.Status[qualState.ID] = &rpc.Status{
+					Code:    int32(codes.OK),
+					Message: "qualification created successfully",
+				}
+			}
+		}
+
+		// Start individual qualifications
+		for _, qualState := range qualificationStates {
+			go lq.executeQualification(context.Background(), qualState)
+		}
+	}
+
+	log.Infof("Created %d valid qualifications, %d validation errors",
+		len(qualificationStates), len(validationErrors))
+
+	return response, nil
+}
+
+// validateQualificationConfig validates a single qualification configuration
+func (lq *linkQualification) validateQualificationConfig(config *plqpb.QualificationConfiguration) error {
+	id := config.GetId()
+
+	// Check for duplicate ID across all operations
+	_, exists := lq.qualifications[id]
+	if exists {
+		return status.Errorf(codes.AlreadyExists, "qualification id already exists")
+	}
+
+	// Validate interface exists in the system
+	interfaceName := config.GetInterfaceName()
+	interfacePath := ocpath.Root().Interface(interfaceName)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := ygnmi.Get(ctx, lq.c, interfacePath.State())
+	if err != nil {
+		return status.Errorf(codes.NotFound, "interface %s not found", interfaceName)
+	}
+
+	if config.GetEndpointType() == nil {
+		return status.Errorf(codes.InvalidArgument, "endpoint type is required")
+	}
+	if config.GetTiming() == nil {
+		return status.Errorf(codes.InvalidArgument, "timing configuration is required")
+	}
+
+	// Validate timing configuration content
+	timing := config.GetTiming()
+	switch t := timing.(type) {
+	case *plqpb.QualificationConfiguration_Rpc:
+		rpcTiming := t.Rpc
+		if rpcTiming.GetDuration() == nil {
+			return status.Errorf(codes.InvalidArgument, "test duration is required")
+		}
+		duration := rpcTiming.GetDuration().AsDuration()
+		if duration <= 0 {
+			return status.Errorf(codes.InvalidArgument, "test duration must be positive")
+		}
+	case *plqpb.QualificationConfiguration_Ntp:
+		// NTP timing is not implemented in simulation
+		return status.Errorf(codes.Unimplemented, "NTP timing is not implemented in simulation")
+	default:
+		return status.Errorf(codes.InvalidArgument, "unknown timing configuration type")
+	}
+
+	// Validate endpoint type configuration
+	switch et := config.GetEndpointType().(type) {
+	case *plqpb.QualificationConfiguration_PacketGenerator:
+		pg := et.PacketGenerator
+		if pg.GetPacketRate() == 0 {
+			return status.Errorf(codes.InvalidArgument, "packet rate must be greater than 0")
+		}
+	case *plqpb.QualificationConfiguration_PacketInjector:
+		// PacketInjector is not implemented in simulation
+		return status.Errorf(codes.Unimplemented, "PacketInjector endpoint type is not implemented in simulation")
+	case *plqpb.QualificationConfiguration_AsicLoopback:
+		// ASIC loopback is valid with any non-nil configuration
+	case *plqpb.QualificationConfiguration_PmdLoopback:
+		// PMD loopback is valid with any non-nil configuration
+	default:
+		return status.Errorf(codes.InvalidArgument, "unknown endpoint type")
+	}
+
+	return nil
+}
+
+// createQualificationState creates a qualification state from config
+func (lq *linkQualification) createQualificationState(config *plqpb.QualificationConfiguration) *QualificationState {
+	isGenerator := config.GetPacketGenerator() != nil
+	isReflector := config.GetAsicLoopback() != nil || config.GetPmdLoopback() != nil
+
+	state := &QualificationState{
+		ID:            config.GetId(),
+		InterfaceName: config.GetInterfaceName(),
+		State:         plqpb.QualificationState_QUALIFICATION_STATE_IDLE,
+		Config:        config,
+		StartTime:     time.Now(),
+		IsGenerator:   isGenerator,
+		IsReflector:   isReflector,
+		cancelCh:      make(chan struct{}, 1),
+		done:          false,
+	}
+
+	log.Infof("Created qualification state: id=%s, interface=%s, generator=%v, reflector=%v",
+		state.ID, state.InterfaceName, state.IsGenerator, state.IsReflector)
+
+	return state
+}
+
+// executeQualification runs a single qualification by calling fakedevice simulation
+func (lq *linkQualification) executeQualification(ctx context.Context, qual *QualificationState) {
+	// Create cancellable context for the simulation
+	qualCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Handle cancellation immediately
+	go func() {
+		select {
+		case <-qual.cancelCh:
+			log.Infof("Qualification %s cancelled", qual.ID)
+			cancel()
+		case <-qualCtx.Done():
+		}
+	}()
+
+	// Update callback function to replace channel communication
+	updateCallback := func(result *fakedevice.LinkQualificationResult) {
+		qual.mu.Lock()
+		defer qual.mu.Unlock()
+
+		if qual.done {
+			return
+		}
+
+		qual.State = result.State
+		qual.packetsSent.Store(result.PacketsSent)
+		qual.packetsReceived.Store(result.PacketsReceived)
+		qual.packetsDropped.Store(result.PacketsDropped)
+		qual.packetsError.Store(result.PacketsError)
+		qual.StartTime = result.StartTime
+		if !result.EndTime.IsZero() {
+			qual.EndTime = result.EndTime
+		}
+
+		// Mark as done if in terminal state
+		if result.State == plqpb.QualificationState_QUALIFICATION_STATE_COMPLETED ||
+			result.State == plqpb.QualificationState_QUALIFICATION_STATE_ERROR {
+			qual.done = true
+		}
+
+		log.Infof("Qualification %s transitioned to state %v", qual.ID, result.State)
+	}
+
+	// Run the simulation with the callback.
+	log.Infof("Starting RunPacketLinkQualification for %s", qual.ID)
+	if err := fakedevice.RunPacketLinkQualification(qualCtx, lq.c, qual.Config, updateCallback, lq.config); err != nil {
+		log.Errorf("Link qualification simulation failed for %s: %v", qual.ID, err)
+		// Mark qualification as failed
+		qual.mu.Lock()
+		qual.State = plqpb.QualificationState_QUALIFICATION_STATE_ERROR
+		qual.done = true
+		qual.EndTime = time.Now()
+		qual.mu.Unlock()
+	} else {
+		log.Infof("RunPacketLinkQualification completed successfully for %s", qual.ID)
+	}
 }
 
 type wavelengthRouter struct {
