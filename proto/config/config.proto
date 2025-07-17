@@ -1,0 +1,87 @@
+// Configuration for gNOI service failure injection
+message GnoiFailureConfig {
+  // System service failure configuration
+  SystemFailureConfig system_failure = 1;
+  
+  // Link qualification failure configuration  
+  LinkQualificationFailureConfig link_qualification_failure = 2;
+  
+  // Global failure settings
+  bool enabled = 10;
+  float global_failure_rate = 11; // 0.0-1.0, probability of any operation failing
+}
+
+message SystemFailureConfig {
+  // Reboot operation failures
+  RebootFailureConfig reboot_failure = 1;
+  
+  // Switchover operation failures
+  SwitchoverFailureConfig switchover_failure = 2;
+  
+  // Process kill operation failures  
+  ProcessKillFailureConfig process_kill_failure = 3;
+}
+
+message RebootFailureConfig {
+  float failure_probability = 1;              // 0.0-1.0
+  repeated RebootFailureMode failure_modes = 2;
+  int64 mean_time_to_failure_ms = 3;          // Average time before failure occurs
+  int64 failure_recovery_time_ms = 4;         // Time to recover from failure
+}
+
+message SwitchoverFailureConfig {
+  float failure_probability = 1;
+  repeated SwitchoverFailureMode failure_modes = 2;
+  int64 mean_time_to_failure_ms = 3;
+  bool allow_partial_switchover = 4;          // Whether switchover can partially complete
+}
+
+message ProcessKillFailureConfig {
+  float failure_probability = 1;
+  repeated ProcessKillFailureMode failure_modes = 2;
+  repeated string protected_processes = 3;    // Processes that cannot be killed
+}
+
+message LinkQualificationFailureConfig {
+  float setup_failure_probability = 1;       // Failure during SETUP phase
+  float running_failure_probability = 2;     // Failure during RUNNING phase  
+  float teardown_failure_probability = 3;    // Failure during TEARDOWN phase
+  repeated LinkQualFailureMode failure_modes = 4;
+}
+
+enum RebootFailureMode {
+  REBOOT_FAILURE_UNSPECIFIED = 0;
+  REBOOT_FAILURE_HANG = 1;                   // Reboot hangs and never completes
+  REBOOT_FAILURE_PARTIAL = 2;                // Reboot starts but fails midway
+  REBOOT_FAILURE_POWER_LOSS = 3;             // Simulated power failure during reboot
+  REBOOT_FAILURE_HARDWARE_ERROR = 4;         // Hardware error prevents reboot
+}
+
+enum SwitchoverFailureMode {
+  SWITCHOVER_FAILURE_UNSPECIFIED = 0;
+  SWITCHOVER_FAILURE_COMMUNICATION = 1;      // Communication failure between supervisors
+  SWITCHOVER_FAILURE_STATE_SYNC = 2;         // State synchronization failure
+  SWITCHOVER_FAILURE_HARDWARE = 3;           // Hardware failure on target supervisor
+  SWITCHOVER_FAILURE_TIMEOUT = 4;            // Switchover times out
+}
+
+enum ProcessKillFailureMode {
+  PROCESS_KILL_FAILURE_UNSPECIFIED = 0;
+  PROCESS_KILL_FAILURE_PERMISSION_DENIED = 1; // Process cannot be killed due to permissions
+  PROCESS_KILL_FAILURE_NOT_RESPONDING = 2;    // Process doesn't respond to kill signal
+  PROCESS_KILL_FAILURE_RESTART_FAILED = 3;    // Process killed but restart fails
+  PROCESS_KILL_FAILURE_ZOMBIE = 4;            // Process becomes zombie
+}
+
+enum LinkQualFailureMode {
+  LINK_QUAL_FAILURE_UNSPECIFIED = 0;
+  LINK_QUAL_FAILURE_INTERFACE_DOWN = 1;      // Interface goes down during test
+  LINK_QUAL_FAILURE_HARDWARE_ERROR = 2;      // Hardware error in packet generator
+  LINK_QUAL_FAILURE_RESOURCE_EXHAUSTION = 3; // Insufficient resources for test
+  LINK_QUAL_FAILURE_CALIBRATION_ERROR = 4;   // Test calibration fails
+}
+
+message LemmingConfig {
+  // gNOI failure injection configuration
+  GnoiFailureConfig gnoi_failure = 12;
+} 
