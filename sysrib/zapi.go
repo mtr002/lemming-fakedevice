@@ -163,6 +163,15 @@ func (s *ZServer) Stop() {
 		if s.lis != nil {
 			s.lis.Close()
 		}
+
+		// Close all client connections
+		s.ClientMutex.Lock()
+		for conn := range s.ClientMap {
+			conn.Close()
+		}
+		s.ClientMutex.Unlock()
+
+		// Remove socket file
 		os.Remove(s.path)
 	}
 }
