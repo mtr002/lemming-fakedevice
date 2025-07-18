@@ -14,6 +14,8 @@ go_library(
         "@com_github_golang_glog//:glog",
         "@com_github_google_uuid//:uuid",
         "@com_github_openconfig_gnmi//proto/gnmi",
+        "@com_github_openconfig_gnoi//packet_link_qualification",
+        "@com_github_openconfig_gnoi//system",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",

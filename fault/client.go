@@ -25,6 +25,8 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
+	plqpb "github.com/openconfig/gnoi/packet_link_qualification"
+	spb "github.com/openconfig/gnoi/system"
 
 	faultpb "github.com/openconfig/lemming/proto/fault"
 )
@@ -333,4 +335,155 @@ func (sc *UnaryClient[ReqT, RespT]) process() {
 			})
 		}
 	}
+}
+
+// ---------------------
+// gNOI System Methods
+// ---------------------
+
+// GNOIReboot starts intercepting gnoi.system.System/Reboot calls.
+func (c *Client) GNOIReboot(t testing.TB) *UnaryClient[*spb.RebootRequest, *spb.RebootResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*spb.RebootRequest, *spb.RebootResponse]("/gnoi.system.System/Reboot", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOICancelReboot starts intercepting gnoi.system.System/CancelReboot calls.
+func (c *Client) GNOICancelReboot(t testing.TB) *UnaryClient[*spb.CancelRebootRequest, *spb.CancelRebootResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*spb.CancelRebootRequest, *spb.CancelRebootResponse]("/gnoi.system.System/CancelReboot", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOISwitchControlProcessor starts intercepting gnoi.system.System/SwitchControlProcessor calls.
+func (c *Client) GNOISwitchControlProcessor(t testing.TB) *UnaryClient[*spb.SwitchControlProcessorRequest, *spb.SwitchControlProcessorResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*spb.SwitchControlProcessorRequest, *spb.SwitchControlProcessorResponse]("/gnoi.system.System/SwitchControlProcessor", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOIKillProcess starts intercepting gnoi.system.System/KillProcess calls.
+func (c *Client) GNOIKillProcess(t testing.TB) *UnaryClient[*spb.KillProcessRequest, *spb.KillProcessResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*spb.KillProcessRequest, *spb.KillProcessResponse]("/gnoi.system.System/KillProcess", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOITime starts intercepting gnoi.system.System/Time calls.
+func (c *Client) GNOITime(t testing.TB) *UnaryClient[*spb.TimeRequest, *spb.TimeResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*spb.TimeRequest, *spb.TimeResponse]("/gnoi.system.System/Time", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOIPing starts intercepting gnoi.system.System/Ping calls.
+func (c *Client) GNOIPing(t testing.TB) *StreamClient[*spb.PingRequest, *spb.PingResponse] {
+	t.Helper()
+	sc, err := newStreamClient[*spb.PingRequest, *spb.PingResponse]("/gnoi.system.System/Ping", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go sc.process()
+
+	return sc
+}
+
+// --------------------------------
+// gNOI Link Qualification Methods
+// --------------------------------
+
+// GNOILinkQualificationCapabilities starts intercepting gnoi.packet_link_qualification.LinkQualification/Capabilities calls.
+func (c *Client) GNOILinkQualificationCapabilities(t testing.TB) *UnaryClient[*plqpb.CapabilitiesRequest, *plqpb.CapabilitiesResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*plqpb.CapabilitiesRequest, *plqpb.CapabilitiesResponse]("/gnoi.packet_link_qualification.LinkQualification/Capabilities", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOILinkQualificationCreate starts intercepting gnoi.packet_link_qualification.LinkQualification/Create calls.
+func (c *Client) GNOILinkQualificationCreate(t testing.TB) *UnaryClient[*plqpb.CreateRequest, *plqpb.CreateResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*plqpb.CreateRequest, *plqpb.CreateResponse]("/gnoi.packet_link_qualification.LinkQualification/Create", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOILinkQualificationGet starts intercepting gnoi.packet_link_qualification.LinkQualification/Get calls.
+func (c *Client) GNOILinkQualificationGet(t testing.TB) *UnaryClient[*plqpb.GetRequest, *plqpb.GetResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*plqpb.GetRequest, *plqpb.GetResponse]("/gnoi.packet_link_qualification.LinkQualification/Get", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOILinkQualificationDelete starts intercepting gnoi.packet_link_qualification.LinkQualification/Delete calls.
+func (c *Client) GNOILinkQualificationDelete(t testing.TB) *UnaryClient[*plqpb.DeleteRequest, *plqpb.DeleteResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*plqpb.DeleteRequest, *plqpb.DeleteResponse]("/gnoi.packet_link_qualification.LinkQualification/Delete", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
+}
+
+// GNOILinkQualificationList starts intercepting gnoi.packet_link_qualification.LinkQualification/List calls.
+func (c *Client) GNOILinkQualificationList(t testing.TB) *UnaryClient[*plqpb.ListRequest, *plqpb.ListResponse] {
+	t.Helper()
+	uc, err := newUnaryClient[*plqpb.ListRequest, *plqpb.ListResponse]("/gnoi.packet_link_qualification.LinkQualification/List", c.fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go uc.process()
+
+	return uc
 }
