@@ -23,13 +23,18 @@ go_library(
 
 go_test(
     name = "fault_test",
-    srcs = ["fault_test.go"],
+    srcs = [
+        "fault_test.go",
+        "interceptor_test.go",
+    ],
     embed = [":fault"],
     deps = [
         "//fault/proto/test",
         "//proto/fault",
         "@com_github_google_go_cmp//cmp",
         "@com_github_openconfig_gnmi//errdiff",
+        "@com_github_openconfig_gnoi//system",
+        "@org_golang_google_genproto_googleapis_rpc//status",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//credentials/insecure",

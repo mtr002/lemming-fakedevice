@@ -28,6 +28,7 @@ go_library(
         "//gnsi",
         "//gribi",
         "//internal/config",
+        "//internal/fault",
         "//p4rt",
         "//proto/config",
         "//proto/fault",

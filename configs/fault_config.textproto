@@ -1,0 +1,45 @@
+fault_config {
+  gnoi_faults {
+    rpc_method: "/gnoi.system.System/Reboot"
+    faults {
+      msg_id: "reboot_fault_1"
+      # Return an error status without executing the reboot
+      status {
+        code: 3  # INVALID_ARGUMENT
+        message: "Simulated reboot failure - system maintenance mode"
+      }
+    }
+    faults {
+      msg_id: "reboot_fault_2" 
+      # Return a different error on subsequent calls
+      status {
+        code: 14  # UNAVAILABLE
+        message: "Simulated reboot failure - resource temporarily unavailable"
+      }
+    }
+  }
+
+  gnoi_faults {
+    rpc_method: "/gnoi.system.System/Ping"
+    faults {
+      msg_id: "ping_fault_1"
+      # Inject network unreachable error for ping
+      status {
+        code: 14  # UNAVAILABLE  
+        message: "Network unreachable"
+      }
+    }
+  }
+
+  gnoi_faults {
+    rpc_method: "/gnoi.system.System/KillProcess" 
+    faults {
+      msg_id: "kill_process_fault_1"
+      # Simulate permission denied
+      status {
+        code: 7  # PERMISSION_DENIED
+        message: "Insufficient privileges to kill process"
+      }
+    }
+  }
+}

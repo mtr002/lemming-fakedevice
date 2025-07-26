@@ -42,6 +42,7 @@ import (
 	fgnsi "github.com/openconfig/lemming/gnsi"
 	fgribi "github.com/openconfig/lemming/gribi"
 	"github.com/openconfig/lemming/internal/config"
+	faultmgr "github.com/openconfig/lemming/internal/fault"
 	fp4rt "github.com/openconfig/lemming/p4rt"
 	configpb "github.com/openconfig/lemming/proto/config"
 	faultpb "github.com/openconfig/lemming/proto/fault"
@@ -70,6 +71,7 @@ type Device struct {
 	gnsiServer   *fgnsi.Server
 	p4rtServer   *fp4rt.Server
 	dplaneServer *dataplane.Dataplane
+	faultManager *faultmgr.Manager
 
 	// Configuration
 	config *configpb.Config
@@ -271,9 +273,23 @@ func New(targetName, zapiURL string, opts ...Option) (*Device, error) {
 	}
 
 	var faultService *gRPCService
+	var faultManager *faultmgr.Manager
 
+	// Initialize fault interceptor and manager based on configuration
+	faultInt := fault.NewInterceptor()
+
+	// Create fault manager from configuration
+	faultManager, err = faultmgr.NewManager(lemmingConfig.GetFaultConfig(), faultInt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create fault manager: %w", err)
+	}
+
+	// Always add fault interceptors to support config-based faults
+	streamInt = append(streamInt, faultInt.Stream)
+	unaryInt = append(unaryInt, faultInt.Unary)
+
+	// Only start fault service if explicitly enabled for external clients
 	if resolvedOpts.faultInject {
-		faultInt := fault.NewInterceptor()
 		l, err := net.Listen("tcp", resolvedOpts.faultAddr)
 		if err != nil {
 			return nil, err
@@ -281,8 +297,6 @@ func New(targetName, zapiURL string, opts ...Option) (*Device, error) {
 		srv := grpc.NewServer(grpc.Creds(creds))
 		faultpb.RegisterFaultInjectServer(srv, faultInt)
 
-		streamInt = append(streamInt, faultInt.Stream)
-		unaryInt = append(unaryInt, faultInt.Unary)
 		faultService = &gRPCService{
 			lis:     l,
 			s:       srv,
@@ -373,6 +387,7 @@ func New(targetName, zapiURL string, opts ...Option) (*Device, error) {
 			stopped: make(chan struct{}),
 		},
 		faultService: faultService,
+		faultManager: faultManager,
 		gnmiServer:   gnmiServer,
 		gnoiServer:   gnoiServer,
 		gribiServer:  gribiServer,
@@ -443,6 +458,11 @@ func (d *Device) Stop() error {
 	defer d.errsMu.Unlock()
 	if err := d.gnmiServer.StopReconcilers(context.Background()); err != nil {
 		d.errs = append(d.errs, err)
+	}
+
+	// Stop fault manager
+	if d.faultManager != nil {
+		d.faultManager.Stop()
 	}
 
 	if len(d.errs) == 0 {
