@@ -1,0 +1,41 @@
+fault_config {
+  gnoi_faults {
+    rpc_method: "/gnoi.system.System/Reboot"
+    faults {
+      status {
+        code: 13
+        message: "Reboot failed with Internal error"
+      }
+    }
+    faults {
+      status {
+        code: 13
+        message: "Reboot failed again with Internal error"
+      }
+    }
+    faults {
+      status {
+        code: 0
+        message: "ok"
+      }
+    }
+  }
+  gnoi_faults {
+    rpc_method: "/gnoi.system.System/SwitchControlProcessor"
+    faults {
+      status {
+        code: 13
+        message: "Switchover failed with Internal error"
+      }
+    }
+  }
+  gnoi_faults {
+    rpc_method: "/gnoi.system.System/KillProcess"
+    faults {
+      status {
+        code: 13
+        message: "Kill process failed with Internal error"
+      }
+    }
+  }
+}
